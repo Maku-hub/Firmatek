@@ -1,0 +1,19 @@
+# Dane produkcyjne (nie commitować!)
+data/
+
+# Env
+.env
+
+# Node
+client/node_modules/
+client/dist/
+
+# Rust/Tauri build
+client/src-tauri/target/
+
+# Go build
+server/firmatek-server
+
+# Archiwum
+*.zip
+*.tar.gz

@@ -1,0 +1,32 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  background: #0f0f13;
+  color: #e0e0e0;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* AuthScreen ma własny scroll - pozwól mu działać */
+.auth-scroll {
+  overflow: auto !important;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3a5e; }
+
+.shiki { padding: 16px; overflow-x: auto; font-size: 13px; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+a { color: #6366f1; }

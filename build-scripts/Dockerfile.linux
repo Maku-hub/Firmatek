@@ -1,0 +1,20 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y curl ca-certificates && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y \
+      nodejs build-essential \
+      file libssl-dev libgtk-3-dev \
+      libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+      patchelf libfuse2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+COPY client/ ./
+RUN npm install
+RUN npm run tauri:build -- --bundles appimage
