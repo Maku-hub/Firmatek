@@ -2,19 +2,21 @@ import { useState } from 'react'
 import { useStore } from '../../store'
 import { createChannel, createDirectChannel, getMessages, getChannelMembers, addChannelMember, leaveChannel } from '../../services/api'
 import ConfirmDialog from '../UI/ConfirmDialog'
+import { dmPartnerId } from '../../lib/dm'
+import { t } from '../../i18n'
 import type { User, Channel } from '../../types'
 
 function formatLastSeen(lastSeen: string): string {
-  if (!lastSeen) return 'offline'
+  if (!lastSeen) return t('time.offline')
   const diff = Date.now() - new Date(lastSeen).getTime()
   const mins = Math.floor(diff / 60_000)
-  if (mins < 1) return 'przed chwilą'
-  if (mins < 60) return `${mins} min temu`
+  if (mins < 1) return t('time.justNow')
+  if (mins < 60) return t('time.minAgo', { n: mins })
   const hours = Math.floor(mins / 60)
-  if (hours < 24) return `${hours} godz. temu`
+  if (hours < 24) return t('time.hoursAgo', { n: hours })
   const days = Math.floor(hours / 24)
-  if (days < 30) return `${days} dn. temu`
-  return 'dawno temu'
+  if (days < 30) return t('time.daysAgo', { n: days })
+  return t('time.longAgo')
 }
 
 interface Props {
@@ -35,7 +37,7 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
   const [channelMembers, setChannelMembers] = useState<User[]>([])
   const [showAddMember, setShowAddMember] = useState(false)
 
-  // Dialogi potwierdzenia
+  // Confirmation dialogs
   const [confirmLogout, setConfirmLogout] = useState(false)
   const [confirmLeave, setConfirmLeave] = useState<string | null>(null) // channelId
 
@@ -97,24 +99,10 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
     setShowMembersFor(null)
   }
 
-  const getDMName = (ch: Channel): string => {
-    if (!ch.is_direct) return ch.name
-    const parts = ch.name.split(':')
-    if (parts.length === 3) {
-      const otherId = parts[1] === currentUser.id ? parts[2] : parts[1]
-      return users[otherId]?.display_name ?? 'Wiadomość bezpośrednia'
-    }
-    return ch.name
-  }
-
   const getDMUser = (ch: Channel): (typeof users)[string] | undefined => {
     if (!ch.is_direct) return undefined
-    const parts = ch.name.split(':')
-    if (parts.length === 3) {
-      const otherId = parts[1] === currentUser.id ? parts[2] : parts[1]
-      return users[otherId]
-    }
-    return undefined
+    const otherId = dmPartnerId(ch.name, currentUser.id)
+    return otherId ? users[otherId] : undefined
   }
 
   const publicChannels = channels.filter((c) => !c.is_direct)
@@ -132,9 +120,9 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
         </div>
 
         <div style={s.tabs}>
-          {(['channels', 'users'] as const).map((t) => (
-            <button key={t} style={{ ...s.tabBtn, ...(tab === t ? s.tabActive : {}) }} onClick={() => setTab(t)}>
-              {t === 'channels' ? 'Kanały' : 'Ludzie'}
+          {(['channels', 'users'] as const).map((tabKey) => (
+            <button key={tabKey} style={{ ...s.tabBtn, ...(tab === tabKey ? s.tabActive : {}) }} onClick={() => setTab(tabKey)}>
+              {tabKey === 'channels' ? t('sidebar.channels') : t('sidebar.people')}
             </button>
           ))}
         </div>
@@ -143,7 +131,7 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
           {tab === 'channels' && <>
             <div style={s.section}>
               <div style={s.sectionHeader}>
-                <span>KANAŁY</span>
+                <span>{t('sidebar.channelsHeader')}</span>
                 <button style={s.addBtn} onClick={() => setShowNewChannel(!showNewChannel)}>+</button>
               </div>
 
@@ -151,9 +139,9 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
                 <div style={s.newChannelForm}>
                   <input style={s.input} value={newChannelName}
                     onChange={(e) => setNewChannelName(e.target.value)}
-                    placeholder="nazwa-kanału" autoFocus
+                    placeholder={t('sidebar.channelNamePlaceholder')} autoFocus
                     onKeyDown={(e) => e.key === 'Enter' && handleCreateChannel()} />
-                  <div style={{ fontSize: 11, color: '#888', margin: '6px 0 4px' }}>Dodaj uczestników:</div>
+                  <div style={{ fontSize: 11, color: '#888', margin: '6px 0 4px' }}>{t('sidebar.addMembers')}</div>
                   <div style={{ maxHeight: 120, overflowY: 'auto' }}>
                     {userList.map((u) => (
                       <label key={u.id} style={s.checkRow}>
@@ -164,37 +152,39 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
                       </label>
                     ))}
                   </div>
-                  <button style={s.createBtn} onClick={handleCreateChannel}>Utwórz kanał</button>
+                  <button style={s.createBtn} onClick={handleCreateChannel}>{t('sidebar.createChannel')}</button>
                 </div>
               )}
 
               {publicChannels.map((ch) => (
                 <div key={ch.id}>
                   <div style={{ ...s.channelItem, ...(ch.id === activeChannelId ? s.channelActive : {}) }}
-                    onClick={() => handleSelectChannel(ch.id)}>
+                    role="button" tabIndex={0}
+                    onClick={() => handleSelectChannel(ch.id)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleSelectChannel(ch.id) }}>
                     <span style={{ color: ch.id === activeChannelId ? '#fff' : '#aaa', fontSize: 14, flex: 1 }}>
                       # {ch.name}
                     </span>
-                    <button style={s.infoBtn} onClick={(e) => handleShowMembers(ch, e)} title="Uczestnicy">👥</button>
+                    <button style={s.infoBtn} onClick={(e) => handleShowMembers(ch, e)} title={t('sidebar.members')}>👥</button>
                     {(unread[ch.id] ?? 0) > 0 && <span style={s.badge}>{unread[ch.id]}</span>}
                   </div>
 
                   {showMembersFor === ch.id && (
                     <div style={s.memberPanel}>
-                      <div style={{ color: '#888', fontSize: 11, marginBottom: 6 }}>UCZESTNICY</div>
+                      <div style={{ color: '#888', fontSize: 11, marginBottom: 6 }}>{t('sidebar.membersHeader')}</div>
                       {channelMembers.map((m) => (
                         <div key={m.id} style={s.memberRow}>
                           <div style={{ width: 6, height: 6, borderRadius: '50%', background: m.online ? '#22c55e' : '#555', flexShrink: 0 }} />
                           <span style={{ color: '#ccc', fontSize: 12, flex: 1 }}>{m.display_name}</span>
                         </div>
                       ))}
-                      <button style={s.addMemberBtn} onClick={() => setShowAddMember(!showAddMember)}>+ Dodaj osobę</button>
+                      <button style={s.addMemberBtn} onClick={() => setShowAddMember(!showAddMember)}>{t('sidebar.addPerson')}</button>
                       {showAddMember && nonMembers.map((u) => (
                         <div key={u.id} style={{ ...s.memberRow, cursor: 'pointer' }} onClick={() => handleAddMember(u.id)}>
                           <span style={{ color: '#6366f1', fontSize: 12 }}>+ {u.display_name}</span>
                         </div>
                       ))}
-                      <button style={s.leaveBtn} onClick={() => setConfirmLeave(ch.id)}>↩ Opuść kanał</button>
+                      <button style={s.leaveBtn} onClick={() => setConfirmLeave(ch.id)}>{t('sidebar.leaveChannel')}</button>
                     </div>
                   )}
                 </div>
@@ -203,15 +193,17 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
 
             {dmChannels.length > 0 && (
               <div style={s.section}>
-                <div style={s.sectionHeader}><span>WIADOMOŚCI BEZPOŚREDNIE</span></div>
+                <div style={s.sectionHeader}><span>{t('sidebar.directMessages')}</span></div>
                 {dmChannels.map((ch) => {
                   const otherUser = getDMUser(ch)
                   return (
                     <div key={ch.id} style={{ ...s.channelItem, ...(ch.id === activeChannelId ? s.channelActive : {}) }}
-                      onClick={() => handleSelectChannel(ch.id)}>
+                      role="button" tabIndex={0}
+                      onClick={() => handleSelectChannel(ch.id)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') handleSelectChannel(ch.id) }}>
                       <span style={{ width: 7, height: 7, borderRadius: '50%', background: otherUser?.online ? '#22c55e' : '#555', flexShrink: 0 }} />
                       <span style={{ color: ch.id === activeChannelId ? '#fff' : '#aaa', fontSize: 14, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {otherUser?.display_name ?? 'Wiadomość bezpośrednia'}
+                        {otherUser?.display_name ?? t('chat.directMessage')}
                       </span>
                       {(unread[ch.id] ?? 0) > 0 && <span style={s.badge}>{unread[ch.id]}</span>}
                     </div>
@@ -223,15 +215,17 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
 
           {tab === 'users' && (
             <div style={s.section}>
-              <div style={s.sectionHeader}><span>WSPÓŁPRACOWNICY</span></div>
+              <div style={s.sectionHeader}><span>{t('sidebar.coworkers')}</span></div>
               {userList.map((user) => (
-                <div key={user.id} style={s.userItem} onClick={() => handleOpenDM(user)}>
-                  <div style={{ ...s.avatar, background: user.avatar_color }}>{user.display_name[0].toUpperCase()}</div>
+                <div key={user.id} style={s.userItem} role="button" tabIndex={0}
+                  onClick={() => handleOpenDM(user)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleOpenDM(user) }}>
+                  <div style={{ ...s.avatar, background: user.avatar_color }}>{(user.display_name?.[0] ?? '?').toUpperCase()}</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ color: '#ddd', fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user.display_name}</div>
                     <div style={{ color: '#666', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}>
                       <span style={{ width: 6, height: 6, borderRadius: '50%', display: 'inline-block', background: user.online ? '#22c55e' : '#555' }} />
-                      {user.online ? 'online' : formatLastSeen(user.last_seen)}
+                      {user.online ? t('sidebar.online') : formatLastSeen(user.last_seen)}
                     </div>
                   </div>
                 </div>
@@ -242,22 +236,22 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
 
         {/* Footer */}
         <div style={s.footer}>
-          <div style={{ ...s.avatar, background: currentUser.avatar_color }}>{currentUser.display_name[0].toUpperCase()}</div>
+          <div style={{ ...s.avatar, background: currentUser.avatar_color }}>{(currentUser.display_name?.[0] ?? '?').toUpperCase()}</div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ color: '#fff', fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentUser.display_name}</div>
-            <div style={{ color: '#22c55e', fontSize: 11 }}>● online</div>
+            <div style={{ color: '#22c55e', fontSize: 11 }}>● {t('sidebar.online')}</div>
           </div>
-          <button style={s.footerBtn} onClick={onOpenSettings} title="Ustawienia">⚙</button>
-          <button style={s.footerBtn} onClick={() => setConfirmLogout(true)} title="Wyloguj">⏏</button>
+          <button style={s.footerBtn} onClick={onOpenSettings} title={t('sidebar.settings')}>⚙</button>
+          <button style={s.footerBtn} onClick={() => setConfirmLogout(true)} title={t('sidebar.logout')}>⏏</button>
         </div>
       </div>
 
       {confirmLogout && (
         <ConfirmDialog
-          title="Wylogowanie"
-          message="Czy na pewno chcesz się wylogować?"
-          confirmLabel="Wyloguj"
-          cancelLabel="Anuluj"
+          title={t('sidebar.logout')}
+          message={t('sidebar.logoutConfirm')}
+          confirmLabel={t('sidebar.logout')}
+          cancelLabel={t('sidebar.cancel')}
           onConfirm={() => { setConfirmLogout(false); onLogout() }}
           onCancel={() => setConfirmLogout(false)}
         />
@@ -265,10 +259,10 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
 
       {confirmLeave && (
         <ConfirmDialog
-          title="Opuść kanał"
-          message={`Czy na pewno chcesz opuścić kanał # ${channels.find(c => c.id === confirmLeave)?.name}?`}
-          confirmLabel="Opuść"
-          cancelLabel="Anuluj"
+          title={t('sidebar.leaveTitle')}
+          message={t('sidebar.leaveConfirm', { name: channels.find(c => c.id === confirmLeave)?.name ?? '' })}
+          confirmLabel={t('sidebar.leave')}
+          cancelLabel={t('sidebar.cancel')}
           danger
           onConfirm={handleLeaveConfirmed}
           onCancel={() => setConfirmLeave(null)}

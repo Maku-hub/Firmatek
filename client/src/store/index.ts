@@ -19,6 +19,7 @@ interface AppState {
   messages: Record<string, Message[]>
   addMessage: (msg: Message) => void
   setMessages: (channelId: string, msgs: Message[]) => void
+  prependMessages: (channelId: string, older: Message[]) => void
   typing: Record<string, Set<string>>
   setTyping: (channelId: string, userId: string, isTyping: boolean) => void
   transfers: Record<string, { filename: string; progress: number; status: string; direction: string }>
@@ -65,10 +66,23 @@ export const useStore = create<AppState>((set) => ({
     set((state) => {
       const existing = state.messages[msg.channel_id] ?? []
       if (existing.some((m) => m.id === msg.id)) return {}
-      return { messages: { ...state.messages, [msg.channel_id]: [...existing, msg] } }
+      // Keep chronological order even if a message arrives late/out of order
+      // (e.g. queued offline messages delivered on reconnect).
+      const next = [...existing, msg].sort(
+        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+      )
+      return { messages: { ...state.messages, [msg.channel_id]: next } }
     }),
   setMessages: (channelId, msgs) =>
     set((state) => ({ messages: { ...state.messages, [channelId]: msgs } })),
+  prependMessages: (channelId, older) =>
+    set((state) => {
+      const existing = state.messages[channelId] ?? []
+      const ids = new Set(existing.map((m) => m.id))
+      const merged = [...older.filter((m) => !ids.has(m.id)), ...existing]
+      merged.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+      return { messages: { ...state.messages, [channelId]: merged } }
+    }),
   typing: {},
   setTyping: (channelId, userId, isTyping) =>
     set((state) => {

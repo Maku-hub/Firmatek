@@ -19,15 +19,15 @@ export interface Channel {
 export type MessageType = 'text' | 'code_snippet' | 'file_inline' | 'file_ref' | 'system'
 
 export interface MessageMeta {
-  // Kod
+  // Code
   language?: string
   filename?: string
-  // Plik inline (mały obraz/screen)
+  // Inline file (small image/screenshot)
   mime_type?: string
   size_bytes?: number
   width?: number
   height?: number
-  // Plik offline
+  // Offline file
   file_id?: string
   orig_name?: string
   sha256?: string
@@ -59,6 +59,8 @@ export type WSMessageType =
   | 'rtc_answer'
   | 'ice_candidate'
   | 'rtc_decline'
+  | 'ping'
+  | 'pong'
   | 'error'
 
 export interface WSMessage {

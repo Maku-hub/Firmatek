@@ -6,6 +6,8 @@ import { loadSettings } from '../Settings/SettingsModal'
 import { getMessages } from '../../services/api'
 import type { Message } from '../../types'
 import type { IncomingOffer } from '../../services/webrtc'
+import { dmPartnerId } from '../../lib/dm'
+import { t } from '../../i18n'
 import CodeBlock from './CodeBlock'
 import FileTransferBar from './FileTransferBar'
 import EmojiPicker from './EmojiPicker'
@@ -17,6 +19,7 @@ export default function ChatWindow() {
   const setTransfer = useStore((s) => s.setTransfer)
   const removeTransfer = useStore((s) => s.removeTransfer)
   const setMessages = useStore((s) => s.setMessages)
+  const prependMessages = useStore((s) => s.prependMessages)
   const setActiveChannel = useStore((s) => s.setActiveChannel)
   const clearUnread = useStore((s) => s.clearUnread)
 
@@ -29,6 +32,8 @@ export default function ChatWindow() {
   const [scrollToMsgId, setScrollToMsgId] = useState<string | null>(null)
 
   const [incomingOffer, setIncomingOffer] = useState<{ offer: IncomingOffer; senderName: string } | null>(null)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const [fullyLoaded, setFullyLoaded] = useState<Set<string>>(new Set())
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
@@ -40,7 +45,7 @@ export default function ChatWindow() {
   const isDM = channel?.is_direct ?? false
   const activeTransfers = Object.entries(transfers)
 
-  // Nasłuchuj przychodzących plików WebRTC
+  // Listen for incoming WebRTC files
   useEffect(() => {
     const handler = (e: Event) => {
       const { offer, senderName } = (e as CustomEvent).detail
@@ -50,18 +55,41 @@ export default function ChatWindow() {
     return () => window.removeEventListener('rtc-incoming', handler)
   }, [])
 
-  // Auto-scroll do dołu
+  // Auto-scroll to the bottom on a new (newest) message or channel switch — but
+  // NOT when older messages are prepended (which changes length but not the last id).
+  const lastMsgId = channelMessages[channelMessages.length - 1]?.id
   useEffect(() => {
     if (!scrollToMsgId) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [channelMessages.length, scrollToMsgId])
+  }, [lastMsgId, activeChannelId, scrollToMsgId])
 
-  // Scroll do konkretnej wiadomości z wyszukiwarki
+  const loadOlder = async () => {
+    if (!activeChannelId || loadingOlder) return
+    const oldest = channelMessages[0]
+    if (!oldest) return
+    setLoadingOlder(true)
+    const older = await getMessages(activeChannelId, oldest.created_at, 50).catch(() => [] as Message[])
+    if (older.length < 50) {
+      setFullyLoaded((prev) => new Set(prev).add(activeChannelId))
+    }
+    if (older.length > 0) {
+      const el = messagesRef.current
+      const prevHeight = el?.scrollHeight ?? 0
+      prependMessages(activeChannelId, older)
+      // Preserve the viewport position after older messages are prepended.
+      requestAnimationFrame(() => {
+        if (el) el.scrollTop = el.scrollHeight - prevHeight
+      })
+    }
+    setLoadingOlder(false)
+  }
+
+  // Scroll to a specific message from the search panel
   useEffect(() => {
     if (!scrollToMsgId) return
     let attempts = 0
-    const maxAttempts = 30 // ~2 sekundy
+    const maxAttempts = 30 // ~2 seconds
     let rafId = 0
 
     const tryScroll = () => {
@@ -77,7 +105,7 @@ export default function ChatWindow() {
         attempts++
         rafId = requestAnimationFrame(() => setTimeout(tryScroll, 60))
       } else {
-        setScrollToMsgId(null) // element nie znaleziony po wielu próbach
+        setScrollToMsgId(null) // element not found after many attempts
       }
     }
     tryScroll()
@@ -133,7 +161,7 @@ export default function ChatWindow() {
     setText((prev) => prev + emoji); setShowEmoji(false); inputRef.current?.focus()
   }
 
-  // ─── Wszystkie pliki → P2P ──────────────────────────────────────────────────
+  // ─── All files → P2P ────────────────────────────────────────────────────────
   const setupProgressCallback = () => {
     webrtcService.setProgressCallback((state) => {
       setTransfer(state.id, { filename: state.filename, progress: state.progress, status: state.status, direction: state.direction })
@@ -147,7 +175,7 @@ export default function ChatWindow() {
     if (!activeChannelId || !currentUser) return
 
     if (!isDM) {
-      alert('Wysyłanie plików jest dostępne tylko w wiadomościach bezpośrednich (DM).')
+      alert(t('chat.filesOnlyDM'))
       return
     }
 
@@ -160,7 +188,7 @@ export default function ChatWindow() {
         type: 'chat_message', channel_id: activeChannelId,
         payload: {
           channel_id: activeChannelId,
-          content: `⚠️ Nie można wysłać pliku „${file.name}" — odbiorca jest offline. Transfer P2P wymaga połączenia obu osób.`,
+          content: t('chat.cannotSendOffline', { name: file.name }),
           type: 'text',
         },
       })
@@ -174,9 +202,7 @@ export default function ChatWindow() {
 
   const getDMRecipient = (): string | null => {
     if (!channel?.is_direct || !currentUser) return null
-    const parts = channel.name.split(':')
-    if (parts.length === 3) return parts[1] === currentUser.id ? parts[2] : parts[1]
-    return null
+    return dmPartnerId(channel.name, currentUser.id)
   }
 
   const handlePaste = (e: React.ClipboardEvent) => {
@@ -194,7 +220,7 @@ export default function ChatWindow() {
     if (file) handleFile(file)
   }
 
-  // Akceptowanie przychodzącego pliku WebRTC
+  // Accepting an incoming WebRTC file
   const handleAcceptFile = async () => {
     if (!incomingOffer) return
     const { offer } = incomingOffer
@@ -207,9 +233,11 @@ export default function ChatWindow() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url; a.download = offer.filename; a.click()
-      URL.revokeObjectURL(url)
+      // Defer revocation so the WebView has time to start reading the blob;
+      // revoking synchronously right after click() can abort the download.
+      setTimeout(() => URL.revokeObjectURL(url), 10_000)
     } catch (err) {
-      console.error('[P2P] Błąd odbierania:', err)
+      console.error('[P2P] Receive error:', err)
     }
   }
 
@@ -217,31 +245,28 @@ export default function ChatWindow() {
     return (
       <div style={s.empty}>
         <div style={{ fontSize: 48, marginBottom: 16 }}>💬</div>
-        <div style={{ color: '#444', fontSize: 16 }}>Wybierz kanał lub rozmowę</div>
+        <div style={{ color: '#444', fontSize: 16 }}>{t('chat.selectChannel')}</div>
       </div>
     )
   }
 
   const typingUsers = [...(typing[activeChannelId] ?? [])]
     .filter((id) => id !== currentUser?.id)
-    .map((id) => users[id]?.display_name ?? 'ktoś')
+    .map((id) => users[id]?.display_name ?? t('chat.someone'))
 
   let channelTitle = channel.name
   if (channel.is_direct) {
-    const parts = channel.name.split(':')
-    if (parts.length === 3) {
-      const otherId = parts[1] === currentUser?.id ? parts[2] : parts[1]
-      channelTitle = users[otherId]?.display_name ?? 'Wiadomość bezpośrednia'
-    }
+    const otherId = dmPartnerId(channel.name, currentUser?.id ?? '')
+    channelTitle = (otherId && users[otherId]?.display_name) || t('chat.directMessage')
   }
 
   const recipientOnline = isDM ? (users[getDMRecipient() ?? '']?.online ?? false) : null
 
   const placeholderText = codeMode
-    ? 'Wklej kod… (Ctrl+Enter = wyślij)'
+    ? t('chat.placeholderCode')
     : settings.sendOnEnter
-      ? 'Napisz wiadomość… (Enter = wyślij, Shift+Enter = nowa linia)'
-      : 'Napisz wiadomość… (Ctrl+Enter = wyślij, Enter = nowa linia)'
+      ? t('chat.placeholderEnter')
+      : t('chat.placeholderCtrlEnter')
 
   return (
     <div style={{ ...s.chat, ...(dragging ? s.chatDragging : {}) }}
@@ -256,11 +281,11 @@ export default function ChatWindow() {
           <span style={s.statusBadge}>
             <span style={{ ...s.statusDotSmall, background: recipientOnline ? '#22c55e' : '#555' }} />
             <span style={{ color: recipientOnline ? '#22c55e' : '#666', fontSize: 12 }}>
-              {recipientOnline ? 'online' : 'offline'}
+              {recipientOnline ? t('chat.online') : t('chat.offline')}
             </span>
           </span>
         )}
-        <button style={s.searchBtn} onClick={() => setShowSearch(!showSearch)} title="Szukaj wiadomości (Ctrl+F)">🔍</button>
+        <button style={s.searchBtn} onClick={() => setShowSearch(!showSearch)} title={t('chat.searchTitle')}>🔍</button>
       </div>
 
       {/* Transfer bars */}
@@ -275,6 +300,11 @@ export default function ChatWindow() {
 
       {/* Messages */}
       <div ref={messagesRef} style={s.messages}>
+        {channelMessages.length > 0 && activeChannelId && !fullyLoaded.has(activeChannelId) && (
+          <button style={s.loadOlderBtn} onClick={loadOlder} disabled={loadingOlder}>
+            {loadingOlder ? t('chat.loadingOlder') : t('chat.loadEarlier')}
+          </button>
+        )}
         {channelMessages.map((msg) => (
           <MessageBubble key={msg.id} msg={msg} currentUserId={currentUser?.id ?? ''} users={users} />
         ))}
@@ -282,14 +312,14 @@ export default function ChatWindow() {
       </div>
 
       {typingUsers.length > 0 && (
-        <div style={s.typingBar}>✏️ {typingUsers.join(', ')} {typingUsers.length === 1 ? 'pisze' : 'piszą'}…</div>
+        <div style={s.typingBar}>✏️ {typingUsers.join(', ')} {typingUsers.length === 1 ? t('chat.isTyping') : t('chat.areTyping')}…</div>
       )}
 
       {/* Input */}
       <div style={s.inputArea}>
         {codeMode && (
           <div style={s.codeModeBar}>
-            <span style={{ color: '#aaa', fontSize: 12 }}>Tryb kodu – Ctrl+Enter = wyślij</span>
+            <span style={{ color: '#aaa', fontSize: 12 }}>{t('chat.codeMode')}</span>
             <select style={s.langSelect} value={codeLang} onChange={(e) => setCodeLang(e.target.value)}>
               {LANGUAGES.map((l) => <option key={l} value={l}>{l}</option>)}
             </select>
@@ -298,7 +328,7 @@ export default function ChatWindow() {
         )}
         <div style={s.inputRow}>
           {isDM && (
-            <label style={s.iconBtn} title={recipientOnline ? 'Wyślij plik (P2P)' : 'Odbiorca offline – brak P2P'}>
+            <label style={s.iconBtn} title={recipientOnline ? t('chat.sendFileP2P') : t('chat.recipientOfflineNoP2P')}>
               <span style={{ opacity: recipientOnline ? 1 : 0.4 }}>📎</span>
               <input type="file" style={{ display: 'none' }} onChange={(e) => {
                 const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''
@@ -306,7 +336,7 @@ export default function ChatWindow() {
             </label>
           )}
           <button style={{ ...s.iconBtn, ...(codeMode ? s.iconBtnActive : {}) }}
-            onClick={() => setCodeMode(!codeMode)} title="Wstaw kod">{'</>'}</button>
+            onClick={() => setCodeMode(!codeMode)} title={t('chat.insertCode')}>{'</>'}</button>
           <div style={{ position: 'relative', flex: 1 }}>
             <textarea ref={inputRef}
               style={{ ...s.input, ...(codeMode ? s.inputCode : {}), width: '100%' }}
@@ -319,23 +349,23 @@ export default function ChatWindow() {
               </div>
             )}
           </div>
-          <button style={s.iconBtn} onClick={() => setShowEmoji(!showEmoji)} title="Emoji">😊</button>
+          <button style={s.iconBtn} onClick={() => setShowEmoji(!showEmoji)} title={t('chat.emoji')}>😊</button>
           <button style={{ ...s.sendBtn, opacity: !text.trim() ? 0.4 : 1 }}
-            onClick={sendMessage} disabled={!text.trim()}>➤</button>
+            onClick={sendMessage} disabled={!text.trim()} aria-label={t('chat.send')}>➤</button>
         </div>
       </div>
 
       {dragging && (
         <div style={s.dropOverlay}>
-          <div style={{ color: '#6366f1', fontSize: 24, fontWeight: 700 }}>⬆️ Upuść plik tutaj</div>
+          <div style={{ color: '#6366f1', fontSize: 24, fontWeight: 700 }}>{t('chat.dropFile')}</div>
         </div>
       )}
 
       {incomingOffer && (
         <ConfirmDialog
-          title="📨 Przychodzący plik"
-          message={`${incomingOffer.senderName} chce wysłać:\n${incomingOffer.offer.filename} (${formatSize(incomingOffer.offer.fileSize)})\n\nCzy chcesz przyjąć?`}
-          confirmLabel="Przyjmij" cancelLabel="Odrzuć"
+          title={t('chat.incomingFile')}
+          message={t('chat.wantsToSend', { name: incomingOffer.senderName, file: incomingOffer.offer.filename, size: formatSize(incomingOffer.offer.fileSize) })}
+          confirmLabel={t('chat.accept')} cancelLabel={t('chat.decline')}
           onConfirm={handleAcceptFile}
           onCancel={() => { webrtcService.declineIncoming(incomingOffer.offer); setIncomingOffer(null) }}
         />
@@ -373,7 +403,7 @@ function MessageBubble({ msg, currentUserId, users }: {
       case 'file_inline':
         return (
           <div>
-            <img src={msg.content} alt={msg.metadata?.orig_name ?? 'obraz'}
+            <img src={msg.content} alt={msg.metadata?.orig_name ?? t('chat.image')}
               style={{ maxWidth: 400, maxHeight: 300, borderRadius: 8, display: 'block' }} />
             {msg.metadata?.orig_name && <div style={{ color: '#888', fontSize: 11, marginTop: 4 }}>{msg.metadata.orig_name}</div>}
           </div>
@@ -393,11 +423,11 @@ function MessageBubble({ msg, currentUserId, users }: {
     <div data-msg-id={msg.id} style={{ ...s.message, ...(isMe ? s.messageMe : {}) }}>
       {!isMe && (
         <div style={{ width: 32, height: 32, borderRadius: '50%', background: sender?.avatar_color ?? '#6366f1', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 13, fontWeight: 700, flexShrink: 0 }}>
-          {(sender?.display_name ?? '?')[0].toUpperCase()}
+          {(sender?.display_name?.[0] ?? '?').toUpperCase()}
         </div>
       )}
       <div style={{ maxWidth: '70%' }}>
-        {!isMe && <div style={s.senderName}>{sender?.display_name ?? 'Nieznany'}</div>}
+        {!isMe && <div style={s.senderName}>{sender?.display_name ?? t('chat.unknown')}</div>}
         <div style={{ ...s.bubble, ...(isMe ? s.bubbleMe : s.bubbleThem) }}>
           {renderContent()}
         </div>
@@ -433,6 +463,7 @@ const s: Record<string, React.CSSProperties> = {
   statusDotSmall: { width: 7, height: 7, borderRadius: '50%', flexShrink: 0 },
   searchBtn: { background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 14, padding: '4px 8px', borderRadius: 6, opacity: 0.5, flexShrink: 0 },
   messages: { flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 2 },
+  loadOlderBtn: { alignSelf: 'center', margin: '4px 0 10px', background: '#1a1a2e', border: '1px solid #2a2a3e', color: '#888', cursor: 'pointer', borderRadius: 8, padding: '5px 14px', fontSize: 12 },
   typingBar: { padding: '4px 20px', color: '#666', fontSize: 12, minHeight: 20 },
   inputArea: { padding: '10px 16px 14px', borderTop: '1px solid #1e1e2e' },
   codeModeBar: { display: 'flex', alignItems: 'center', gap: 8, background: '#1a1a2e', borderRadius: '8px 8px 0 0', padding: '6px 12px', borderBottom: '1px solid #333' },

@@ -14,20 +14,17 @@
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-autostart": "^2.0.0",
     "@tauri-apps/plugin-notification": "^2.0.0",
-    "@tauri-apps/plugin-shell": "^2.0.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "zustand": "^4.5.4",
     "shiki": "^1.22.0",
-    "date-fns": "^3.6.0",
-    "clsx": "^2.1.1"
+    "zustand": "^4.5.4"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
+    "@vitejs/plugin-react": "^4.7.0",
     "typescript": "^5.5.3",
-    "vite": "^5.4.2"
+    "vite": "^7.3.6"
   }
 }

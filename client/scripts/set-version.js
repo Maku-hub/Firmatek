@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Przepisuje wersję z APP_VERSION w .env do package.json i tauri.conf.json
+// Copies the version from APP_VERSION in .env into package.json and tauri.conf.json
 const fs = require('fs')
 const path = require('path')
 
@@ -20,8 +20,9 @@ const env = {
   ...parseEnv(path.join(root, '.env')),
 }
 
-const version = env.APP_VERSION || '1.0.0'
-console.log(`[set-version] Wersja: ${version}`)
+// Priority: explicit APP_VERSION env (CI/Docker) > .env/.env.example > default.
+const version = process.env.APP_VERSION || env.APP_VERSION || '1.0.0'
+console.log(`[set-version] Version: ${version}`)
 
 const pkgPath = path.resolve(__dirname, '../package.json')
 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
@@ -33,4 +34,10 @@ const tauri = JSON.parse(fs.readFileSync(tauriPath, 'utf8'))
 tauri.version = version
 fs.writeFileSync(tauriPath, JSON.stringify(tauri, null, 2) + '\n')
 
-console.log(`[set-version] Zaktualizowano package.json i tauri.conf.json`)
+// Keep the Rust crate version in sync (only the [package] version, which is the
+// sole line-start `version = "..."` — dependency versions are inline).
+const cargoPath = path.resolve(__dirname, '../src-tauri/Cargo.toml')
+const cargo = fs.readFileSync(cargoPath, 'utf8').replace(/^version = "[^"]*"/m, `version = "${version}"`)
+fs.writeFileSync(cargoPath, cargo)
+
+console.log(`[set-version] Updated package.json, tauri.conf.json and Cargo.toml`)

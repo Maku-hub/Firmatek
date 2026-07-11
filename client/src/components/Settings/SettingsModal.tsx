@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart'
+import { t, getLocale, setLocale, LOCALES } from '../../i18n'
 
 interface Settings {
   uiScale: number
@@ -21,7 +22,7 @@ function saveSettings(s: Settings) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(s))
 }
 
-// Skaluje tylko wrapper głównej aplikacji (nie ekran logowania)
+// Scales only the main app wrapper (not the login screen)
 export function applyScale(scale: number) {
   const wrapper = document.getElementById('app-wrapper')
   if (!wrapper) return
@@ -41,14 +42,14 @@ export function applyScale(scale: number) {
     return
   }
 
-  // Preferuj CSS zoom – zachowuje layout, scrollbary i interaktywność
-  // (działa w Chromium/WebView2/WebKitGTK, czyli we wszystkich środowiskach Tauri)
+  // Prefer CSS zoom – preserves layout, scrollbars and interactivity
+  // (works in Chromium/WebView2/WebKitGTK, i.e. across all Tauri environments)
   if ('zoom' in document.documentElement.style) {
     ;(wrapper.style as any).zoom = pct
     wrapper.style.width = '100%'
     wrapper.style.height = '100%'
   } else {
-    // Fallback: transform scale (Firefox itp.)
+    // Fallback: transform scale (Firefox, etc.)
     wrapper.style.transformOrigin = 'top left'
     wrapper.style.transform = `scale(${pct})`
     wrapper.style.width = `${100 / pct}%`
@@ -69,7 +70,7 @@ export default function SettingsModal({ onClose }: Props) {
     saveSettings(settings)
   }, [settings])
 
-  // Pobierz aktualny stan autostartu
+  // Fetch the current autostart state
   useEffect(() => {
     isAutostartEnabled()
       .then(setAutostart)
@@ -81,7 +82,7 @@ export default function SettingsModal({ onClose }: Props) {
     try {
       if (autostart) { await disableAutostart() } else { await enableAutostart() }
       setAutostart(!autostart)
-    } catch { /* plugin niedostępny */ }
+    } catch { /* plugin unavailable */ }
   }
 
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) =>
@@ -89,16 +90,16 @@ export default function SettingsModal({ onClose }: Props) {
 
   return (
     <div style={s.overlay} onClick={onClose}>
-      <div style={s.modal} onClick={(e) => e.stopPropagation()}>
+      <div style={s.modal} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={t('settings.title')}>
         <div style={s.header}>
-          <span style={s.title}>⚙️ Ustawienia</span>
+          <span style={s.title}>{t('settings.title')}</span>
           <button style={s.closeBtn} onClick={onClose}>✕</button>
         </div>
 
         <section style={s.section}>
-          <div style={s.sectionTitle}>WYGLĄD</div>
+          <div style={s.sectionTitle}>{t('settings.appearance')}</div>
           <div style={s.row}>
-            <span style={s.label}>Skala interfejsu</span>
+            <span style={s.label}>{t('settings.uiScale')}</span>
             <span style={s.value}>{settings.uiScale}%</span>
           </div>
           <input type="range" min={75} max={200} step={25}
@@ -115,54 +116,66 @@ export default function SettingsModal({ onClose }: Props) {
             ))}
           </div>
           <div style={{ color: '#555', fontSize: 11, marginTop: 8 }}>
-            Skalowanie powiększa wszystkie elementy (do użytku przez osoby niedowidzące)
+            {t('settings.scaleHint')}
           </div>
         </section>
 
         <section style={s.section}>
-          <div style={s.sectionTitle}>KLAWIATURA</div>
+          <div style={s.sectionTitle}>{t('settings.keyboard')}</div>
           <label style={s.checkRow}>
             <input type="radio" checked={settings.sendOnEnter}
               onChange={() => update('sendOnEnter', true)} />
             <div>
-              <div style={s.label}>Enter = wyślij wiadomość</div>
-              <div style={s.hint}>Shift+Enter = nowa linia</div>
+              <div style={s.label}>{t('settings.enterSend')}</div>
+              <div style={s.hint}>{t('settings.shiftEnterNewline')}</div>
             </div>
           </label>
           <label style={{ ...s.checkRow, marginTop: 8 }}>
             <input type="radio" checked={!settings.sendOnEnter}
               onChange={() => update('sendOnEnter', false)} />
             <div>
-              <div style={s.label}>Ctrl+Enter = wyślij wiadomość</div>
-              <div style={s.hint}>Enter = nowa linia</div>
+              <div style={s.label}>{t('settings.ctrlEnterSend')}</div>
+              <div style={s.hint}>{t('settings.enterNewline')}</div>
             </div>
           </label>
         </section>
 
         <section style={s.section}>
-          <div style={s.sectionTitle}>POWIADOMIENIA</div>
+          <div style={s.sectionTitle}>{t('settings.notifications')}</div>
           <label style={s.checkRow}>
             <input type="checkbox" checked={settings.notifSound}
               onChange={(e) => update('notifSound', e.target.checked)} />
-            <span style={s.label}>Dźwięk przy nowej wiadomości</span>
+            <span style={s.label}>{t('settings.soundNewMessage')}</span>
           </label>
         </section>
 
         <section style={s.section}>
-          <div style={s.sectionTitle}>SYSTEM</div>
+          <div style={s.sectionTitle}>{t('settings.system')}</div>
           <label style={s.checkRow}>
             <input type="checkbox" checked={autostart} disabled={autostartLoading}
               onChange={toggleAutostart} />
             <div>
-              <div style={s.label}>Uruchamiaj przy starcie systemu</div>
-              <div style={s.hint}>Aplikacja uruchomi się automatycznie po zalogowaniu do systemu</div>
+              <div style={s.label}>{t('settings.launchStartup')}</div>
+              <div style={s.hint}>{t('settings.launchHint')}</div>
             </div>
           </label>
         </section>
 
+        <section style={s.section}>
+          <div style={s.sectionTitle}>{t('settings.language')}</div>
+          <select
+            style={{ ...s.label, background: '#252535', border: '1px solid #333', borderRadius: 6, padding: '6px 10px' }}
+            value={getLocale()}
+            onChange={(e) => { setLocale(e.target.value as typeof LOCALES[number]); window.location.reload() }}>
+            {LOCALES.map((l) => (
+              <option key={l} value={l}>{l === 'en' ? 'English' : 'Polski'}</option>
+            ))}
+          </select>
+        </section>
+
         <div style={s.footer}>
-          <button style={s.resetBtn} onClick={() => setSettings(DEFAULT)}>Przywróć domyślne</button>
-          <button style={s.doneBtn} onClick={onClose}>Gotowe</button>
+          <button style={s.resetBtn} onClick={() => setSettings(DEFAULT)}>{t('settings.restoreDefaults')}</button>
+          <button style={s.doneBtn} onClick={onClose}>{t('settings.done')}</button>
         </div>
       </div>
     </div>

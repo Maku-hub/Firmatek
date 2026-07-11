@@ -40,7 +40,7 @@ func GenerateToken(userID, username, displayName string) (string, error) {
 func ValidateToken(tokenStr string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("nieoczekiwana metoda podpisywania")
+			return nil, errors.New("unexpected signing method")
 		}
 		return jwtSecret, nil
 	})
@@ -50,7 +50,7 @@ func ValidateToken(tokenStr string) (*Claims, error) {
 
 	claims, ok := token.Claims.(*Claims)
 	if !ok || !token.Valid {
-		return nil, errors.New("nieprawidłowy token")
+		return nil, errors.New("invalid token")
 	}
 	return claims, nil
 }

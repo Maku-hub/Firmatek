@@ -29,30 +29,30 @@ func Connect(cfg *config.RedisConfig) (*Cache, error) {
 	defer cancel()
 
 	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("Redis niedostępny: %w", err)
+		return nil, fmt.Errorf("Redis unavailable: %w", err)
 	}
 
-	fmt.Println("[Cache] Połączono z Redis")
+	fmt.Println("[Cache] Connected to Redis")
 	return &Cache{client: client}, nil
 }
 
-// SetUserOnline – oznacza użytkownika jako online (TTL 90s – odświeżany przez heartbeat)
+// SetUserOnline – marks a user as online (TTL 90s – refreshed by the heartbeat)
 func (c *Cache) SetUserOnline(ctx context.Context, userID string) error {
 	return c.client.Set(ctx, onlineKey(userID), "1", 90*time.Second).Err()
 }
 
-// SetUserOffline – usuwa flagę online
+// SetUserOffline – removes the online flag
 func (c *Cache) SetUserOffline(ctx context.Context, userID string) error {
 	return c.client.Del(ctx, onlineKey(userID)).Err()
 }
 
-// IsUserOnline – sprawdza czy użytkownik jest online
+// IsUserOnline – checks whether a user is online
 func (c *Cache) IsUserOnline(ctx context.Context, userID string) bool {
 	val, err := c.client.Exists(ctx, onlineKey(userID)).Result()
 	return err == nil && val > 0
 }
 
-// GetOnlineUsers – zwraca zbiór online user IDs
+// GetOnlineUsers – returns the set of online user IDs
 func (c *Cache) GetOnlineUsers(ctx context.Context) ([]string, error) {
 	keys, err := c.client.Keys(ctx, "online:*").Result()
 	if err != nil {
@@ -60,12 +60,12 @@ func (c *Cache) GetOnlineUsers(ctx context.Context) ([]string, error) {
 	}
 	users := make([]string, 0, len(keys))
 	for _, k := range keys {
-		users = append(users, k[7:]) // odetnij "online:"
+		users = append(users, k[7:]) // strip the "online:" prefix
 	}
 	return users, nil
 }
 
-// EnqueueOfflineMessage – kolejkuje wiadomość dla offline użytkownika
+// EnqueueOfflineMessage – queues a message for an offline user
 func (c *Cache) EnqueueOfflineMessage(ctx context.Context, userID string, msg interface{}) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -74,12 +74,12 @@ func (c *Cache) EnqueueOfflineMessage(ctx context.Context, userID string, msg in
 	key := offlineQueueKey(userID)
 	pipe := c.client.Pipeline()
 	pipe.RPush(ctx, key, data)
-	pipe.Expire(ctx, key, 7*24*time.Hour) // TTL 7 dni
+	pipe.Expire(ctx, key, 7*24*time.Hour) // TTL 7 days
 	_, err = pipe.Exec(ctx)
 	return err
 }
 
-// DequeueOfflineMessages – pobiera i usuwa wszystkie zakolejkowane wiadomości
+// DequeueOfflineMessages – fetches and removes all queued messages
 func (c *Cache) DequeueOfflineMessages(ctx context.Context, userID string) ([][]byte, error) {
 	key := offlineQueueKey(userID)
 	pipe := c.client.Pipeline()
@@ -104,7 +104,7 @@ func (c *Cache) DequeueOfflineMessages(ctx context.Context, userID string) ([][]
 	return result, nil
 }
 
-// RefreshOnlineTTL – przedłuża TTL online (heartbeat co ~60s)
+// RefreshOnlineTTL – extends the online TTL (heartbeat every ~60s)
 func (c *Cache) RefreshOnlineTTL(ctx context.Context, userID string) error {
 	return c.client.Expire(ctx, onlineKey(userID), 90*time.Second).Err()
 }

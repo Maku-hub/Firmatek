@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from 'react'
 import { searchMessages, type SearchResult } from '../../services/api'
 import { useStore } from '../../store'
+import { dmPartnerId } from '../../lib/dm'
+import { t } from '../../i18n'
 
 interface Props {
   onClose: () => void
@@ -18,6 +20,7 @@ export default function SearchPanel({ onClose, onGoToMessage }: Props) {
 
   useEffect(() => {
     inputRef.current?.focus()
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
   }, [])
 
   const doSearch = (q: string) => {
@@ -44,21 +47,21 @@ export default function SearchPanel({ onClose, onGoToMessage }: Props) {
 
   const getDMName = (r: SearchResult): string => {
     if (!r.is_direct) return `# ${r.channel_name}`
-    const parts = r.channel_name.split(':')
-    if (parts.length === 3) {
-      const otherId = parts[1] === currentUser?.id ? parts[2] : parts[1]
-      return `👤 ${users[otherId]?.display_name ?? 'DM'}`
-    }
-    return '👤 DM'
+    const otherId = dmPartnerId(r.channel_name, currentUser?.id ?? '')
+    return `👤 ${(otherId && users[otherId]?.display_name) || t('search.dm')}`
   }
 
   const highlight = (text: string, q: string): React.ReactNode => {
     if (!q.trim()) return text
     const truncated = text.length > 200 ? text.slice(0, 200) + '…' : text
-    const regex = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
+    const needle = q.trim().toLowerCase()
+    // Split on the (case-insensitively) matched term. The capture group keeps
+    // the matched substrings in the array; compare by value rather than reusing
+    // a stateful /g regex with .test() (whose lastIndex advances between calls).
+    const regex = new RegExp(`(${q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
     const parts = truncated.split(regex)
     return parts.map((part, i) =>
-      regex.test(part)
+      part.toLowerCase() === needle
         ? <mark key={i} style={s.highlight}>{part}</mark>
         : <span key={i}>{part}</span>
     )
@@ -73,27 +76,30 @@ export default function SearchPanel({ onClose, onGoToMessage }: Props) {
           style={s.input}
           value={query}
           onChange={(e) => handleChange(e.target.value)}
-          placeholder="Szukaj wiadomości…"
+          placeholder={t('search.placeholder')}
           onKeyDown={(e) => e.key === 'Escape' && onClose()}
         />
         <button style={s.closeBtn} onClick={onClose}>✕</button>
       </div>
 
       <div style={s.results}>
-        {loading && <div style={s.info}>Szukam…</div>}
+        {loading && <div style={s.info}>{t('search.searching')}</div>}
 
         {!loading && searched && results.length === 0 && (
-          <div style={s.info}>Brak wyników dla „{query}"</div>
+          <div style={s.info}>{t('search.noResults', { query })}</div>
         )}
 
         {results.map((r) => (
           <div
             key={r.id}
             style={s.resultItem}
+            role="button"
+            tabIndex={0}
             onClick={() => onGoToMessage(r.channel_id, r.id)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onGoToMessage(r.channel_id, r.id) } }}
           >
             <div style={s.resultHeader}>
-              <span style={s.senderName}>{r.sender?.display_name ?? 'Nieznany'}</span>
+              <span style={s.senderName}>{r.sender?.display_name ?? t('search.unknown')}</span>
               <span style={s.channelBadge}>{getDMName(r)}</span>
               <span style={s.timestamp}>
                 {new Date(r.created_at).toLocaleDateString('pl', { day: 'numeric', month: 'short' })}{' '}

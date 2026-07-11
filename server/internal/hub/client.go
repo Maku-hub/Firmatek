@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"firmatek/server/internal/cache"
@@ -15,10 +16,10 @@ const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512 * 1024 // 512KB – duże wiadomości to pliki, nie inline
+	maxMessageSize = 512 * 1024 // 512KB – large messages are files, not inline content
 )
 
-// Client – reprezentuje jedno połączenie WebSocket
+// Client – represents a single WebSocket connection
 type Client struct {
 	UserID      string
 	Username    string
@@ -28,9 +29,41 @@ type Client struct {
 	conn *websocket.Conn
 	send chan []byte
 
-	// Zależności potrzebne do obsługi wiadomości
+	// Guards send/close so the channel is never written to or closed twice.
+	mu     sync.Mutex
+	closed bool
+
+	// Dependencies needed to handle messages
 	cache         *cache.Cache
 	messageRouter func(client *Client, msg *models.WSMessage)
+}
+
+// trySend performs a non-blocking send on the client's channel.
+// Returns false if the client is already closed or its buffer is full.
+func (c *Client) trySend(data []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	select {
+	case c.send <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+// closeSend closes the send channel exactly once. Safe to call from multiple
+// goroutines and multiple times.
+func (c *Client) closeSend() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
+	close(c.send)
 }
 
 func NewClient(
@@ -52,7 +85,7 @@ func NewClient(
 	}
 }
 
-// ReadPump – odbiera wiadomości od klienta
+// ReadPump – receives messages from the client
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -71,14 +104,14 @@ func (c *Client) ReadPump() {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				fmt.Printf("[WS] Nieoczekiwane zamknięcie (%s): %v\n", c.UserID, err)
+				fmt.Printf("[WS] Unexpected close (%s): %v\n", c.UserID, err)
 			}
 			break
 		}
 
 		var msg models.WSMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
-			c.sendError("Nieprawidłowy format wiadomości")
+			c.sendError("Invalid message format")
 			continue
 		}
 		msg.SenderID = c.UserID
@@ -87,7 +120,7 @@ func (c *Client) ReadPump() {
 	}
 }
 
-// WritePump – wysyła wiadomości do klienta
+// WritePump – sends messages to the client
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -109,7 +142,7 @@ func (c *Client) WritePump() {
 			}
 			_, _ = w.Write(message)
 
-			// Opróżnij bufor w jednym write
+			// Flush the buffer in a single write
 			n := len(c.send)
 			for i := 0; i < n; i++ {
 				_, _ = w.Write([]byte{'\n'})

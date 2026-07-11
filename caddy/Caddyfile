@@ -1,0 +1,19 @@
+# Minimal TLS-terminating reverse proxy for Firmatek.
+#
+# - On a LAN hostname, `tls internal` issues a self-signed cert from Caddy's
+#   local CA (import the CA into clients to avoid warnings), giving HTTPS with
+#   zero extra config.
+# - For a public domain, remove `tls internal` and Caddy will auto-provision a
+#   Let's Encrypt certificate (the domain must resolve to this host).
+#
+# Caddy transparently proxies WebSocket upgrades, so /ws works without extra
+# directives. Override the hostname with FIRMATEK_DOMAIN in .env.
+
+{$FIRMATEK_DOMAIN:firmatek.local} {
+	tls internal
+	encode zstd gzip
+	request_body {
+		max_size 100MB
+	}
+	reverse_proxy firmatek-server:8080
+}

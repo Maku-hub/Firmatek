@@ -15,13 +15,13 @@ func Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := extractToken(c)
 		if token == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "brak tokenu autoryzacyjnego"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing authorization token"})
 			c.Abort()
 			return
 		}
 		claims, err := ValidateToken(token)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "token wygasł lub jest nieprawidłowy"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "token expired or invalid"})
 			c.Abort()
 			return
 		}
@@ -32,18 +32,18 @@ func Middleware() gin.HandlerFunc {
 	}
 }
 
-// WSTokenFromQuery – WebSocket: token w query param
+// WSTokenFromQuery – WebSocket: token passed as a query parameter
 func WSTokenFromQuery() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := c.Query("token")
 		if token == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "brak tokenu"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 			c.Abort()
 			return
 		}
 		claims, err := ValidateToken(token)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "nieprawidłowy token"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			c.Abort()
 			return
 		}
@@ -54,8 +54,8 @@ func WSTokenFromQuery() gin.HandlerFunc {
 	}
 }
 
-// DownloadAuth – akceptuje token z nagłówka LUB z query param (dla linków download)
-// Zarezerwowane na przyszłość – do pobierania plików z bufora
+// DownloadAuth – accepts a token from the header OR a query parameter (for download links)
+// Reserved for future use – for downloading files from the buffer
 func DownloadAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := extractToken(c)
@@ -63,13 +63,13 @@ func DownloadAuth() gin.HandlerFunc {
 			token = c.Query("token")
 		}
 		if token == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "brak tokenu"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 			c.Abort()
 			return
 		}
 		claims, err := ValidateToken(token)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "nieprawidłowy token"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			c.Abort()
 			return
 		}

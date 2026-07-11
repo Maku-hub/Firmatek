@@ -19,7 +19,7 @@ func Connect(cfg *config.DatabaseConfig) (*DB, error) {
 
 	poolConfig, err := pgxpool.ParseConfig(cfg.DSN())
 	if err != nil {
-		return nil, fmt.Errorf("błąd parsowania DSN: %w", err)
+		return nil, fmt.Errorf("failed to parse DSN: %w", err)
 	}
 
 	poolConfig.MaxConns = 25
@@ -29,19 +29,19 @@ func Connect(cfg *config.DatabaseConfig) (*DB, error) {
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
-		return nil, fmt.Errorf("błąd połączenia z bazą: %w", err)
+		return nil, fmt.Errorf("failed to connect to the database: %w", err)
 	}
 
 	if err := pool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("baza niedostępna: %w", err)
+		return nil, fmt.Errorf("database unavailable: %w", err)
 	}
 
 	db := &DB{Pool: pool}
 	if err := db.migrate(ctx); err != nil {
-		return nil, fmt.Errorf("błąd migracji: %w", err)
+		return nil, fmt.Errorf("migration failed: %w", err)
 	}
 
-	fmt.Println("[DB] Połączono z PostgreSQL i wykonano migracje")
+	fmt.Println("[DB] Connected to PostgreSQL and ran migrations")
 	return db, nil
 }
 
@@ -91,14 +91,14 @@ func (db *DB) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_channel_members_user
 			ON channel_members(user_id)`,
 
-		// Pełnotekstowe wyszukiwanie wiadomości (po polsku i ogólne)
+		// Full-text search over message content
 		`CREATE INDEX IF NOT EXISTS idx_messages_content_search
 			ON messages USING GIN(to_tsvector('simple', content))`,
 	}
 
 	for _, sql := range migrations {
 		if _, err := db.Pool.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("migracja nieudana [%.60s...]: %w", sql, err)
+			return fmt.Errorf("migration failed [%.60s...]: %w", sql, err)
 		}
 	}
 	return nil

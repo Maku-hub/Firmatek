@@ -16,5 +16,5 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 COPY client/ ./
-RUN npm install
+RUN npm ci
 RUN npm run tauri:build -- --bundles deb

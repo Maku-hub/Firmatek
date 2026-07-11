@@ -15,41 +15,49 @@ type LDAPUserInfo struct {
 	Email       string
 }
 
-// AuthenticateLDAP – weryfikuje użytkownika przez AD/LDAP
-// Zwraca dane użytkownika z AD lub błąd
+// AuthenticateLDAP – verifies a user against AD/LDAP
+// Returns the user's data from AD or an error
 func AuthenticateLDAP(cfg *config.LDAPConfig, username, password string) (*LDAPUserInfo, error) {
 	if password == "" {
-		return nil, fmt.Errorf("puste hasło")
+		return nil, fmt.Errorf("empty password")
 	}
 
-	// Połącz z serwerem LDAP
+	// Connect to the LDAP server
 	var l *ldap.Conn
 	var err error
 
+	// TLS verification is on by default; set LDAP_TLS_SKIP_VERIFY=true only for a
+	// self-signed AD certificate.
+	tlsConf := &tls.Config{InsecureSkipVerify: cfg.TLSSkipVerify} //nolint:gosec // opt-in via config
+
 	if strings.HasPrefix(cfg.URL, "ldaps://") {
-		l, err = ldap.DialURL(cfg.URL, ldap.DialWithTLSConfig(&tls.Config{
-			InsecureSkipVerify: false, // Produkcja: false; jeśli self-signed cert: true
-		}))
+		l, err = ldap.DialURL(cfg.URL, ldap.DialWithTLSConfig(tlsConf))
 	} else {
 		l, err = ldap.DialURL(cfg.URL)
 		if err == nil {
-			// Spróbuj STARTTLS dla bezpieczeństwa
-			_ = l.StartTLS(&tls.Config{InsecureSkipVerify: true})
+			// Attempt STARTTLS for security. If it fails (server doesn't offer
+			// it, or demands a client certificate), the connection is left in a
+			// broken state, so reconnect with a fresh plain connection rather
+			// than failing all authentication.
+			if tlsErr := l.StartTLS(tlsConf); tlsErr != nil {
+				l.Close()
+				l, err = ldap.DialURL(cfg.URL)
+			}
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("błąd połączenia z AD: %w", err)
+		return nil, fmt.Errorf("failed to connect to AD: %w", err)
 	}
 	defer l.Close()
 
-	// Bind service account (do wyszukiwania DN użytkownika)
+	// Bind the service account (to look up the user's DN)
 	if cfg.BindUser != "" {
 		if err := l.Bind(cfg.BindUser, cfg.BindPassword); err != nil {
-			return nil, fmt.Errorf("błąd bind service account: %w", err)
+			return nil, fmt.Errorf("service account bind error: %w", err)
 		}
 	}
 
-	// Znajdź DN użytkownika
+	// Find the user's DN
 	filter := fmt.Sprintf(cfg.UserFilter, ldap.EscapeFilter(username))
 	searchReq := ldap.NewSearchRequest(
 		cfg.BaseDN,
@@ -63,17 +71,17 @@ func AuthenticateLDAP(cfg *config.LDAPConfig, username, password string) (*LDAPU
 
 	sr, err := l.Search(searchReq)
 	if err != nil {
-		return nil, fmt.Errorf("błąd wyszukiwania użytkownika: %w", err)
+		return nil, fmt.Errorf("user search error: %w", err)
 	}
 	if len(sr.Entries) == 0 {
-		return nil, fmt.Errorf("użytkownik nie znaleziony w AD")
+		return nil, fmt.Errorf("user not found in AD")
 	}
 
 	userDN := sr.Entries[0].DN
 
-	// Bind jako użytkownik – weryfikacja hasła
+	// Bind as the user – password verification
 	if err := l.Bind(userDN, password); err != nil {
-		return nil, fmt.Errorf("nieprawidłowe hasło")
+		return nil, fmt.Errorf("invalid password")
 	}
 
 	displayName := sr.Entries[0].GetAttributeValue("displayName")

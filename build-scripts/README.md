@@ -1,26 +1,26 @@
-# Budowanie instalatorów klienta
+# Building client installers
 
-Dockerfiles budują klienta w izolowanym środowisku.
-Pliki wyciągasz z kontenera przez `docker cp` po buildzie.
+These Dockerfiles build the client in an isolated environment.
+You extract the files from the container with `docker cp` after the build.
 
-## Linux AppImage (działa na wszystkich dystrybucjach)
+## Linux AppImage (works on all distributions)
 
 ```bash
 cd build-scripts
 
-# Zbuduj obraz (jednorazowo, potem cache)
+# Build the image (once, then cached)
 docker build -f Dockerfile.linux -t firmatek-linux ../
 
-# Uruchom kontener (build już jest w obrazie z poprzedniego kroku)
+# Create a container (the build already lives in the image from the previous step)
 docker create --name firmatek-build firmatek-linux echo done
 
-# Skopiuj wynik
+# Copy out the result
 docker cp firmatek-build:/app/src-tauri/target/release/bundle/appimage ./output-appimage
 
-# Posprzątaj
+# Clean up
 docker rm firmatek-build
 
-# Instalator jest w:
+# The installer is in:
 # output-appimage/Firmatek_*.AppImage
 ```
 
@@ -44,7 +44,7 @@ docker rm firmatek-rpm-build
 # output-rpm/firmatek-*.rpm
 ```
 
-## Windows .msi (na Windows, bez Dockera)
+## Windows .msi (on Windows, without Docker)
 
 ```powershell
 cd ..\client
@@ -53,7 +53,7 @@ npm run tauri:build
 # src-tauri\target\release\bundle\msi\Firmatek_*.msi
 ```
 
-## Skrypt – wszystkie Linuxy naraz
+## Script – all Linux targets at once
 
 ```bash
 #!/bin/bash
@@ -61,13 +61,13 @@ set -e
 cd "$(dirname "$0")"
 
 for target in linux debian rpm; do
-  echo "=== Buduję $target ==="
+  echo "=== Building $target ==="
   docker build -f Dockerfile.$target -t firmatek-$target ../
   docker create --name tmp-$target firmatek-$target echo done
   mkdir -p output-$target
   docker cp tmp-$target:/app/src-tauri/target/release/bundle/. output-$target/
   docker rm tmp-$target
-  echo "=== $target gotowy w output-$target/ ==="
+  echo "=== $target ready in output-$target/ ==="
 done
-echo "Wszystkie gotowe!"
+echo "All done!"
 ```

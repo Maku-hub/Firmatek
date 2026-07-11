@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { login, register, setServerURL, getServerURL, getAuthConfig, type AuthConfig } from '../../services/api'
 import type { User } from '../../types'
+import { t } from '../../i18n'
 
 interface Props { onAuth: (user: User) => void }
 
@@ -17,13 +18,19 @@ export default function AuthScreen({ onAuth }: Props) {
 
   useEffect(() => {
     const url = serverUrl.replace(/\/$/, '')
-    fetch(`${url}/api/auth/config`)
-      .then((r) => r.json())
-      .then((cfg: AuthConfig) => {
-        setAuthConfig(cfg)
-        if (!cfg.registration_enabled) setMode('login')
-      })
-      .catch(() => setAuthConfig(null))
+    // Debounce (server URL changes on every keystroke) and abort stale requests
+    // so out-of-order responses can't apply an old config.
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      fetch(`${url}/api/auth/config`, { signal: controller.signal })
+        .then((r) => r.json())
+        .then((cfg: AuthConfig) => {
+          setAuthConfig(cfg)
+          if (!cfg.registration_enabled) setMode('login')
+        })
+        .catch(() => { /* aborted or unreachable */ })
+    }, 400)
+    return () => { clearTimeout(timer); controller.abort() }
   }, [serverUrl])
 
   const appName = authConfig?.app_name ?? 'Firmatek'
@@ -33,9 +40,9 @@ export default function AuthScreen({ onAuth }: Props) {
   const handleSubmit = async () => {
     setError('')
     if (mode === 'register') {
-      if (!displayName.trim()) { setError('Podaj imię i nazwisko'); return }
-      if (password !== password2) { setError('Hasła nie są identyczne'); return }
-      if (password.length < 6) { setError('Hasło musi mieć co najmniej 6 znaków'); return }
+      if (!displayName.trim()) { setError(t('auth.enterFullName')); return }
+      if (password !== password2) { setError(t('auth.passwordsMismatch')); return }
+      if (password.length < 6) { setError(t('auth.passwordMin6')); return }
     }
     setLoading(true)
     setServerURL(serverUrl)
@@ -48,7 +55,7 @@ export default function AuthScreen({ onAuth }: Props) {
         onAuth(data.user)
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Błąd logowania')
+      setError(e instanceof Error ? e.message : t('auth.loginError'))
     } finally { setLoading(false) }
   }
 
@@ -58,21 +65,21 @@ export default function AuthScreen({ onAuth }: Props) {
     <div style={s.bg}>
       <div style={s.card}>
 
-        {/* Nagłówek – ikona + nazwa w jednym rzędzie */}
+        {/* Header – icon + name in one row */}
         <div style={s.header}>
           <span style={s.icon}>💬</span>
           <div>
             <div style={s.appName}>{appName}</div>
             <div style={s.ldapBadge}>
-              {isLDAP ? '🏢 Active Directory' : 'Komunikator firmowy'}
+              {isLDAP ? '🏢 Active Directory' : t('auth.companyMessenger')}
             </div>
           </div>
         </div>
 
-        {/* Formularz w siatce 2 kolumn dla labeli i inputów */}
+        {/* Form laid out as a 2-column grid of labels and inputs */}
         <div style={s.form}>
 
-          <label style={s.label}>Adres serwera</label>
+          <label style={s.label}>{t('auth.serverAddress')}</label>
           <input style={s.input} value={serverUrl}
             onChange={(e) => setServerUrlState(e.target.value)}
             onBlur={() => setServerURL(serverUrl)}
@@ -83,25 +90,25 @@ export default function AuthScreen({ onAuth }: Props) {
               {(['login', 'register'] as const).map((m) => (
                 <button key={m} style={{ ...s.tab, ...(mode === m ? s.tabActive : {}) }}
                   onClick={() => { setMode(m); setError('') }}>
-                  {m === 'login' ? 'Logowanie' : 'Rejestracja'}
+                  {m === 'login' ? t('auth.signIn') : t('auth.register')}
                 </button>
               ))}
             </div>
           )}
 
-          <label style={s.label}>{isLDAP ? 'Login domenowy' : 'Login'}</label>
+          <label style={s.label}>{isLDAP ? t('auth.domainLogin') : t('auth.login')}</label>
           <input style={s.input} value={username}
             onChange={(e) => setUsername(e.target.value)}
-            placeholder="jan.kowalski" autoComplete="username" />
+            placeholder="john.smith" autoComplete="username" />
 
           {isRegister && <>
-            <label style={s.label}>Imię i nazwisko</label>
+            <label style={s.label}>{t('auth.fullName')}</label>
             <input style={s.input} value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Jan Kowalski" />
+              placeholder="John Smith" />
           </>}
 
-          <label style={s.label}>Hasło{isLDAP ? ' domenowe' : ''}</label>
+          <label style={s.label}>{isLDAP ? t('auth.domainPassword') : t('auth.password')}</label>
           <input style={s.input} type="password" value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder="••••••••"
@@ -109,7 +116,7 @@ export default function AuthScreen({ onAuth }: Props) {
             onKeyDown={(e) => e.key === 'Enter' && !isRegister && handleSubmit()} />
 
           {isRegister && <>
-            <label style={s.label}>Powtórz hasło</label>
+            <label style={s.label}>{t('auth.repeatPassword')}</label>
             <input style={s.input} type="password" value={password2}
               onChange={(e) => setPassword2(e.target.value)}
               placeholder="••••••••" autoComplete="new-password"
@@ -121,7 +128,7 @@ export default function AuthScreen({ onAuth }: Props) {
 
         <button style={{ ...s.btn, opacity: loading ? 0.6 : 1 }}
           onClick={handleSubmit} disabled={loading}>
-          {loading ? 'Łączenie…' : !isRegister ? 'Zaloguj się' : 'Zarejestruj'}
+          {loading ? t('auth.connecting') : !isRegister ? t('auth.signIn') : t('auth.register')}
         </button>
       </div>
     </div>
@@ -129,7 +136,7 @@ export default function AuthScreen({ onAuth }: Props) {
 }
 
 const s: Record<string, React.CSSProperties> = {
-  // Pełny ekran, flex center, overflow pozwala na scroll gdy okno bardzo małe
+  // Full screen, flex center; overflow allows scrolling when the window is very small
   bg: {
     width: '100vw',
     height: '100vh',
@@ -140,7 +147,7 @@ const s: Record<string, React.CSSProperties> = {
     overflow: 'auto',
     padding: 16,
   },
-  // Karta: max-height żeby nie wychodziła poza ekran, własny scroll jeśli trzeba
+  // Card: max-height so it never exceeds the screen, with its own scroll when needed
   card: {
     background: '#1a1a24',
     borderRadius: 12,

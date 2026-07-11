@@ -1,13 +1,15 @@
 import { wsService } from './websocket'
+import { getIceServers } from './api'
 import type { WSMessage } from '../types'
 
 const CHUNK_SIZE = 64 * 1024
 const ACCEPT_TIMEOUT = 60_000
 
-const ICE_SERVERS = [
+// Fallback used only if the server can't be reached for fresh credentials.
+const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'turn:localhost:3478', username: 'firmatek', credential: 'turn_secret_change_me' },
 ]
+const ICE_SERVERS_TTL = 5 * 60_000 // refetch credentials at most every 5 min
 
 export type TransferStatus = 'connecting' | 'transferring' | 'done' | 'error' | 'incoming' | 'declined' | 'cancelled' | 'timeout'
 
@@ -47,6 +49,12 @@ class WebRTCService {
   private pendingOffers = new Map<string, PendingOffer>()
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
   private completed = new Set<string>() // ignores events after done
+  // ICE candidates that arrive before the remote description is set are buffered
+  // here per transfer and flushed once setRemoteDescription() resolves.
+  private pendingCandidates = new Map<string, RTCIceCandidateInit[]>()
+  private remoteSet = new Set<string>()
+  private iceServers: RTCIceServer[] = FALLBACK_ICE_SERVERS
+  private iceServersFetchedAt = 0
   private onProgress?: ProgressCallback
   private onIncoming?: IncomingCallback
 
@@ -60,9 +68,24 @@ class WebRTCService {
   setProgressCallback(cb: ProgressCallback) { this.onProgress = cb }
   setIncomingCallback(cb: IncomingCallback) { this.onIncoming = cb }
 
-  // ─── Wysyłanie pliku ────────────────────────────────────────────────────────
+  // Fetch fresh ICE/TURN servers (short-lived credentials), cached briefly.
+  private async ensureIceServers(): Promise<void> {
+    if (Date.now() - this.iceServersFetchedAt < ICE_SERVERS_TTL) return
+    try {
+      const servers = await getIceServers()
+      if (servers && servers.length) {
+        this.iceServers = servers
+        this.iceServersFetchedAt = Date.now()
+      }
+    } catch {
+      // Keep the previous/fallback servers on failure.
+    }
+  }
+
+  // ─── Sending a file ───────────────────────────────────────────────────────
 
   async sendFile(file: File, targetUserID: string, sha256: string, myUserID: string): Promise<void> {
+    await this.ensureIceServers()
     const transferID = `${myUserID}_${Date.now()}`
     const pc = this.createPeerConnection(transferID, targetUserID)
     this.transferMeta.set(transferID, { filename: file.name, fileSize: file.size })
@@ -103,28 +126,28 @@ class WebRTCService {
     }, ACCEPT_TIMEOUT))
   }
 
-  // Kluczowa poprawka: synchroniczny odczyt chunków z flow control
+  // Key detail: synchronous chunk reading with flow control
   private doStreamFile(dc: RTCDataChannel, file: File, transferID: string, targetUserID: string) {
     const { name, size } = file
     let offset = 0
 
-    // Nagłówek
+    // Header
     dc.send(JSON.stringify({ filename: name, fileSize: size, transferID }))
 
     const MAX_BUFFER = CHUNK_SIZE * 4
 
     const pump = () => {
-      // Jeśli transfer anulowany — stop
+      // If the transfer was cancelled — stop
       if (!this.channels.has(transferID)) return
 
-      // Czekaj aż bufor się opróżni
+      // Wait until the buffer drains
       if (dc.bufferedAmount > MAX_BUFFER) {
         setTimeout(pump, 20)
         return
       }
 
       if (offset >= size) {
-        // Wszystkie chunki wysłane
+        // All chunks sent
         dc.send(JSON.stringify({ type: 'eof' }))
         this.completed.add(transferID)
         this.emit(transferID, targetUserID, name, size, 100, 'done', 'send')
@@ -149,7 +172,7 @@ class WebRTCService {
         }
         const progress = Math.round((offset / size) * 100)
         this.emit(transferID, targetUserID, name, size, progress, 'transferring', 'send')
-        // Kontynuuj natychmiast lub po opróżnieniu bufora
+        // Continue immediately, or once the buffer has drained
         pump()
       })
     }
@@ -157,7 +180,7 @@ class WebRTCService {
     pump()
   }
 
-  // ─── Odbieranie ─────────────────────────────────────────────────────────────
+  // ─── Receiving ──────────────────────────────────────────────────────────────
 
   private handleOffer(msg: WSMessage) {
     const payload = msg.payload as {
@@ -175,9 +198,10 @@ class WebRTCService {
 
   async acceptIncoming(offer: IncomingOffer): Promise<Blob> {
     const pending = this.pendingOffers.get(offer.transferID)
-    if (!pending) throw new Error('Brak oczekującej oferty')
+    if (!pending) throw new Error('No pending offer')
     const { sdp } = pending
     this.pendingOffers.delete(offer.transferID)
+    await this.ensureIceServers()
 
     return new Promise((resolve, reject) => {
       const pc = this.createPeerConnection(offer.transferID, offer.fromUserID)
@@ -225,17 +249,18 @@ class WebRTCService {
 
         dc.onerror = () => {
           if (!this.completed.has(offer.transferID)) {
-            this.cleanup(offer.transferID); reject(new Error('Błąd transferu'))
+            this.cleanup(offer.transferID); reject(new Error('Transfer error'))
           }
         }
         dc.onclose = () => {
           if (!this.completed.has(offer.transferID) && this.receiveBuffers.has(offer.transferID)) {
-            this.cleanup(offer.transferID); reject(new Error('Przerwane'))
+            this.cleanup(offer.transferID); reject(new Error('Interrupted'))
           }
         }
       }
 
       pc.setRemoteDescription(sdp)
+        .then(() => { this.remoteSet.add(offer.transferID); return this.flushCandidates(offer.transferID) })
         .then(() => pc.createAnswer())
         .then((answer) => pc.setLocalDescription(answer))
         .then(() => {
@@ -259,7 +284,7 @@ class WebRTCService {
     })
   }
 
-  // ─── Anulowanie ─────────────────────────────────────────────────────────────
+  // ─── Cancellation ───────────────────────────────────────────────────────────
 
   cancelTransfer(transferID: string) {
     const target = this.transferTargets.get(transferID)
@@ -279,13 +304,44 @@ class WebRTCService {
   private async handleAnswer(msg: WSMessage) {
     const payload = msg.payload as { sdp: RTCSessionDescriptionInit; transferID: string }
     const pc = this.connections.get(payload.transferID)
-    if (pc) { this.clearTimer(payload.transferID); await pc.setRemoteDescription(payload.sdp) }
+    if (!pc) return
+    this.clearTimer(payload.transferID)
+    try {
+      await pc.setRemoteDescription(payload.sdp)
+      this.remoteSet.add(payload.transferID)
+      await this.flushCandidates(payload.transferID)
+    } catch {
+      if (!this.completed.has(payload.transferID)) {
+        const meta = this.transferMeta.get(payload.transferID)
+        const target = this.transferTargets.get(payload.transferID) ?? ''
+        this.emit(payload.transferID, target, meta?.filename ?? '', meta?.fileSize ?? 0, 0, 'error', 'send')
+        this.cleanup(payload.transferID)
+      }
+    }
   }
 
   private async handleICE(msg: WSMessage) {
     const payload = msg.payload as { candidate: RTCIceCandidateInit; transferID: string }
     const pc = this.connections.get(payload.transferID)
-    if (pc) await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(() => {})
+    // Buffer until the peer connection exists AND its remote description is set;
+    // adding a candidate before then throws and the candidate would be lost.
+    if (pc && this.remoteSet.has(payload.transferID)) {
+      await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(() => {})
+    } else {
+      const arr = this.pendingCandidates.get(payload.transferID) ?? []
+      arr.push(payload.candidate)
+      this.pendingCandidates.set(payload.transferID, arr)
+    }
+  }
+
+  private async flushCandidates(transferID: string) {
+    const pc = this.connections.get(transferID)
+    const arr = this.pendingCandidates.get(transferID)
+    if (!pc || !arr) return
+    this.pendingCandidates.delete(transferID)
+    for (const c of arr) {
+      await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {})
+    }
   }
 
   private handleDecline(msg: WSMessage) {
@@ -301,7 +357,7 @@ class WebRTCService {
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
   private createPeerConnection(transferID: string, targetUserID: string): RTCPeerConnection {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers })
     this.transferTargets.set(transferID, targetUserID)
 
     pc.onicecandidate = (e) => {
@@ -339,7 +395,9 @@ class WebRTCService {
     this.transferTargets.delete(transferID)
     this.transferMeta.delete(transferID)
     this.pendingOffers.delete(transferID)
-    // completed czyszczony z opóźnieniem (5s)
+    this.pendingCandidates.delete(transferID)
+    this.remoteSet.delete(transferID)
+    // `completed` is cleared after a delay (5s)
     setTimeout(() => this.completed.delete(transferID), 5000)
   }
 }

@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_DB: firmatek
       POSTGRES_USER: firmatek
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-firmatek_secret}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     ports:
@@ -20,13 +20,17 @@ services:
   redis:
     image: redis:7-alpine
     container_name: firmatek-redis
-    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_secret} --appendonly yes
+    command: redis-server --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env} --appendonly yes
+    environment:
+      # Used by redis-cli in the healthcheck so the password isn't passed on the
+      # command line (which would leak it in the process list).
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
     volumes:
       - ./data/redis:/data
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -43,12 +47,13 @@ services:
       DB_PORT: "5432"
       DB_NAME: firmatek
       DB_USER: firmatek
-      DB_PASSWORD: ${POSTGRES_PASSWORD:-firmatek_secret}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_secret}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      SERVER_PORT: ${SERVER_PORT:-8080}
     ports:
-      - "8080:8080"
+      - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,4 +61,37 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-volumes: {}
+  # Optional TLS-terminating reverse proxy (one-command HTTPS).
+  # Start with:  docker compose --profile proxy up -d
+  # See README for the alternative manual nginx setup.
+  proxy:
+    image: caddy:2-alpine
+    container_name: firmatek-caddy
+    profiles: ["proxy"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  # Optional TURN relay for WebRTC P2P when both peers are behind strict NAT.
+  # Start with:  docker compose --profile turn up -d
+  # Uses host networking because the relay uses a large UDP port range
+  # (49152-65535) that is impractical to publish individually.
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    container_name: firmatek-coturn
+    profiles: ["turn"]
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_SECRET:?set TURN_SECRET in .env to run coturn}"
+      - "--realm=${TURN_REALM:-firmatek.local}"
+    restart: unless-stopped

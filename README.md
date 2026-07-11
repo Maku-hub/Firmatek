@@ -1,50 +1,56 @@
-# Firmatek – Komunikator Firmowy
+# Firmatek – Company Messenger
 
-Desktopowy komunikator dla firm z czatem, kodem, screenshotami i P2P transferem plików.
+[![CI](https://github.com/Maku-hub/Firmatek/actions/workflows/build.yml/badge.svg)](https://github.com/Maku-hub/Firmatek/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/Maku-hub/Firmatek)](https://github.com/Maku-hub/Firmatek/releases)
 
-## Funkcje
+A desktop messenger for companies with chat, code snippets, screenshots and P2P file transfer.
 
-- Kanały grupowe i wiadomości bezpośrednie (DM)
-- Wyszukiwanie wiadomości (Ctrl+F) – full-text search po wszystkich kanałach użytkownika
-- Syntax highlighting kodu (15+ języków, Shiki)
-- Transfer plików P2P przez WebRTC (bez obciążania serwera)
-- Obrazki inline (< 200KB) przez WebSocket
-- Integracja z Active Directory / LDAP
-- Endpoint CI/CD (`POST /api/notify`) do powiadomień z pipeline'ów
-- Skalowanie UI (75–200%) – CSS zoom z fallbackiem na transform
-- Dźwięk powiadomienia przy nowej wiadomości (Web Audio API)
-- Jedna instancja + minimalizacja do zasobnika systemowego (tray)
-- Wskaźnik pisania (typing indicator)
+![UI](images/ui.png)
+
+## Features
+
+- Group channels and direct messages (DM)
+- Message search (Ctrl+F) – full-text search across all of the user's channels
+- Code syntax highlighting (15+ languages, Shiki)
+- P2P file transfer over WebRTC (no server load)
+- Inline images (< 200 KB) over WebSocket
+- Active Directory / LDAP integration
+- CI/CD endpoint (`POST /api/notify`) for notifications from pipelines
+- UI scaling (75–200%) – CSS zoom with a transform fallback
+- Notification sound on new messages (Web Audio API)
+- Single instance + minimize to the system tray
+- Typing indicator
 
 ---
 
-## Szybki start
+## Quick start
 
 ```bash
-# Serwer
+# Server
 cp .env.example .env && nano .env
 docker compose up -d
 
-# Klient (dev)
+# Client (dev)
 cd client && npm install && npm run tauri:dev
 
-# Klient (produkcja)
+# Client (production)
 cd client && npm install && npm run tauri:build
 ```
 
 ---
 
-## Porty i firewall
+## Ports and firewall
 
-### Serwer – porty które MUSZĄ być otwarte
+### Server – ports that MUST be open
 
-| Port | Protokół | Kierunek | Opis |
-|------|----------|----------|------|
-| 8080 | TCP | przychodzący | Główny port API + WebSocket klientów |
-| 443  | TCP | przychodzący | HTTPS przez nginx (gdy używasz SSL) |
-| 80   | TCP | przychodzący | HTTP → redirect na 443 (gdy używasz SSL) |
+| Port | Protocol | Direction | Description |
+|------|----------|-----------|-------------|
+| 8080 | TCP | inbound | Main API + WebSocket port for clients |
+| 443  | TCP | inbound | HTTPS via nginx (when using SSL) |
+| 80   | TCP | inbound | HTTP → redirect to 443 (when using SSL) |
 
-Polecenie na serwerze z `firewalld` (Oracle Linux / RHEL):
+Command on a server with `firewalld` (Oracle Linux / RHEL):
 ```bash
 firewall-cmd --permanent --add-port=8080/tcp
 firewall-cmd --permanent --add-service=http
@@ -52,41 +58,41 @@ firewall-cmd --permanent --add-service=https
 firewall-cmd --reload
 ```
 
-Na serwerze z `ufw` (Ubuntu / Debian):
+On a server with `ufw` (Ubuntu / Debian):
 ```bash
 ufw allow 8080/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 ```
 
-### Porty wewnętrzne (nie wystawiać na zewnątrz!)
+### Internal ports (do NOT expose publicly!)
 
-Domyślnie są już bindowane tylko na `127.0.0.1` w docker-compose:
+By default these are bound only to `127.0.0.1` in docker-compose:
 
-| Port | Usługa |
-|------|--------|
+| Port | Service |
+|------|---------|
 | 5432 | PostgreSQL |
 | 6379 | Redis |
-| 9000 | MinIO API (opcjonalny – profil `storage`) |
-| 9001 | MinIO Console (opcjonalny – profil `storage`) |
+| 9000 | MinIO API (optional – `storage` profile) |
+| 9001 | MinIO Console (optional – `storage` profile) |
 
-> **MinIO jest opcjonalny.** Domyślnie `docker compose up -d` uruchamia tylko PostgreSQL, Redis i serwer Go.
-> Jeśli potrzebujesz bufora offline (MinIO): `docker compose --profile storage up -d`
+> **MinIO is optional.** By default `docker compose up -d` starts only PostgreSQL, Redis and the Go server.
+> If you need an offline buffer (MinIO): `docker compose --profile storage up -d`
 
-### Klient – porty wychodzące
+### Client – outbound ports
 
-Klient inicjuje połączenia wychodzące, nie wymaga otwierania portów przychodzących po stronie klienta.
+The client initiates outbound connections; it does not require any inbound ports to be opened on the client side.
 
-| Port | Protokół | Opis |
-|------|----------|------|
-| 8080 lub 443 | TCP | Połączenie z serwerem Firmatek |
-| Efemeryczne UDP | UDP | WebRTC P2P (automatycznie przez NAT) |
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 8080 or 443 | TCP | Connection to the Firmatek server |
+| Ephemeral UDP | UDP | WebRTC P2P (automatic through NAT) |
 
 ---
 
-## Nginx jako reverse proxy z HTTPS
+## Nginx as a reverse proxy with HTTPS
 
-### Wymagania
+### Requirements
 
 ```bash
 # Ubuntu/Debian
@@ -96,10 +102,10 @@ apt install nginx certbot python3-certbot-nginx
 dnf install nginx certbot python3-certbot-nginx
 ```
 
-### Krok 1 – konfiguracja nginx
+### Step 1 – nginx configuration
 
-Utwórz plik `/etc/nginx/sites-available/firmatek` (Debian/Ubuntu)
-lub `/etc/nginx/conf.d/firmatek.conf` (RHEL/Oracle):
+Create `/etc/nginx/sites-available/firmatek` (Debian/Ubuntu)
+or `/etc/nginx/conf.d/firmatek.conf` (RHEL/Oracle):
 
 ```nginx
 # Redirect HTTP → HTTPS
@@ -113,22 +119,22 @@ server {
     listen 443 ssl http2;
     server_name firmatek.firma.local;
 
-    # Certyfikaty SSL (Let's Encrypt lub własne)
+    # SSL certificates (Let's Encrypt or your own)
     ssl_certificate     /etc/letsencrypt/live/firmatek.firma.local/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/firmatek.firma.local/privkey.pem;
 
-    # Bezpieczne ustawienia SSL
+    # Secure SSL settings
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
 
-    # Proxy do Go serwera
+    # Proxy to the Go server
     location / {
         proxy_pass         http://127.0.0.1:8080;
         proxy_http_version 1.1;
 
-        # Wymagane dla WebSocket
+        # Required for WebSocket
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection "upgrade";
 
@@ -137,70 +143,73 @@ server {
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # Długi timeout dla WebSocket (podtrzymuje połączenie)
+        # Long timeout for WebSocket (keeps the connection alive)
         proxy_read_timeout  3600s;
         proxy_send_timeout  3600s;
 
-        # Rozmiar uploadu plików
+        # File upload size
         client_max_body_size 100M;
     }
 }
 ```
 
-### Krok 2 – aktywuj i certyfikat
+### Step 2 – enable and obtain a certificate
 
 ```bash
 # Debian/Ubuntu
 ln -s /etc/nginx/sites-available/firmatek /etc/nginx/sites-enabled/
 
-# Sprawdź konfigurację
+# Check the configuration
 nginx -t
 
-# Let's Encrypt (publiczna domena)
+# Let's Encrypt (public domain)
 certbot --nginx -d firmatek.firma.local
 
-# Lub certyfikat własny (self-signed dla sieci firmowej)
+# Or a self-signed certificate (for an internal company network)
 openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
   -keyout /etc/ssl/private/firmatek.key \
   -out /etc/ssl/certs/firmatek.crt \
-  -subj "/CN=firmatek.firma.local/O=Firma/C=PL"
+  -subj "/CN=firmatek.firma.local/O=Company/C=PL"
 
-# Uruchom nginx
+# Start nginx
 systemctl enable --now nginx
 ```
 
-### Krok 3 – zaktualizuj adres w kliencie
+### Step 3 – update the server address in the client
 
-W aplikacji w polu "Adres serwera" wpisz:
+In the app, enter the following in the "Server address" field:
 ```
 https://firmatek.firma.local
 ```
 
 ---
 
-## CI/CD – wysyłanie powiadomień
+## CI/CD – sending notifications
 
-Firmatek ma dedykowany endpoint do integracji z pipeline'ami.
-Nie wymaga logowania – używa osobnego tokenu `NOTIFY_TOKEN` z `.env`.
+Firmatek has a dedicated endpoint for integration with pipelines.
+It does not require a login – it uses a separate `NOTIFY_TOKEN` from `.env`.
 
-### Konfiguracja
+The target channel must already exist on the server (the endpoint resolves it by
+name or ID and returns 404 if it is not found).
 
-W `.env` ustaw:
+### Configuration
+
+Set in `.env`:
 ```
-NOTIFY_TOKEN=twoj_tajny_token_cicd
+NOTIFY_TOKEN=your_secret_cicd_token
 ```
 
-### Użycie
+### Usage
 
 #### curl
 ```bash
 curl -X POST https://firmatek.firma.local/api/notify \
   -H "Content-Type: application/json" \
-  -H "X-Notify-Token: twoj_tajny_token_cicd" \
+  -H "X-Notify-Token: your_secret_cicd_token" \
   -d '{
-    "channel": "ogólny",
-    "title": "Deploy zakończony",
-    "message": "Aplikacja wdrożona na produkcję: v1.2.3",
+    "channel": "general",
+    "title": "Deploy finished",
+    "message": "Application deployed to production: v1.2.3",
     "level": "success",
     "footer": "Pipeline #142 | main | 2m 34s"
   }'
@@ -211,7 +220,7 @@ curl -X POST https://firmatek.firma.local/api/notify \
 import requests
 
 FIRMATEK_URL = "https://firmatek.firma.local"
-NOTIFY_TOKEN = "twoj_tajny_token_cicd"
+NOTIFY_TOKEN = "your_secret_cicd_token"
 
 def notify(channel: str, message: str, title: str = "", level: str = "info", footer: str = ""):
     resp = requests.post(
@@ -223,11 +232,11 @@ def notify(channel: str, message: str, title: str = "", level: str = "info", foo
     resp.raise_for_status()
     return resp.json()
 
-# Przykład użycia w pipeline
+# Example usage in a pipeline
 notify(
     channel="cicd",
-    title="Deploy zakończony",
-    message="Środowisko: produkcja\nWersja: v1.2.3\nCommit: abc1234",
+    title="Deploy finished",
+    message="Environment: production\nVersion: v1.2.3\nCommit: abc1234",
     level="success",
     footer=f"Pipeline #{pipeline_id} | {branch}"
 )
@@ -269,50 +278,96 @@ notify_success:
       }'
 ```
 
-Poziomy (`level`): `info` | `success` | `warning` | `error`
+Levels (`level`): `info` | `success` | `warning` | `error`
 
 ---
 
 ## Active Directory / LDAP
 
-W `.env`:
+In `.env`:
 ```
 LDAP_ENABLED=true
 LDAP_URL=ldap://dc.firma.local:389
 LDAP_DOMAIN=firma.local
 LDAP_BASE_DN=DC=firma,DC=local
 LDAP_BIND_USER=svc_firmatek@firma.local
-LDAP_BIND_PASSWORD=haslo
+LDAP_BIND_PASSWORD=password
 LDAP_USER_FILTER=(sAMAccountName=%s)
+LDAP_TLS_SKIP_VERIFY=false
 ENABLE_REGISTRATION=false
 ```
 
-Gdy `ENABLE_REGISTRATION=false` – ekran logowania nie pokazuje zakładki "Rejestracja".
+When `ENABLE_REGISTRATION=false`, the login screen does not show the "Register" tab.
+Set `LDAP_TLS_SKIP_VERIFY=true` only if your directory uses a self-signed
+certificate. With `ldap://` the server attempts STARTTLS and, if it fails,
+falls back to a plain connection.
 
 ---
 
-## API – wyszukiwanie wiadomości
+## Optional services (compose profiles)
+
+The core `docker compose up -d` runs PostgreSQL, Redis and the Go server. Two
+optional services are available via profiles:
+
+```bash
+# TURN relay for WebRTC when both peers are behind strict NAT.
+# Requires TURN_SECRET (and TURN_URLS on the server) in .env.
+docker compose --profile turn up -d
+
+# One-command TLS reverse proxy (Caddy) as an alternative to the manual nginx
+# setup above. Serves FIRMATEK_DOMAIN with an internal (self-signed) cert.
+docker compose --profile proxy up -d
+```
+
+Relevant `.env` settings (see `.env.example` for the full list):
+
+| Variable | Purpose |
+|----------|---------|
+| `ALLOWED_ORIGINS` | Comma-separated CORS/WebSocket origins. Empty = allow all (dev). |
+| `TURN_SECRET` / `TURN_URLS` / `TURN_TTL` | Time-limited HMAC TURN credentials issued via `GET /api/turn-credentials`. |
+| `TURN_REALM` | coturn realm (must match the client). |
+| `FIRMATEK_DOMAIN` | Hostname served by the optional Caddy proxy. |
+
+---
+
+## API – message search
 
 ```
-GET /api/messages/search?q=tekst&limit=50
+GET /api/messages/search?q=text&limit=50
 Authorization: Bearer <JWT>
 ```
 
-Wyszukuje wiadomości we wszystkich kanałach użytkownika. Parametry:
-- `q` (wymagany) – fraza do wyszukania (ILIKE + full-text search)
-- `limit` (opcjonalny, domyślnie 50, max 200) – liczba wyników
+Searches messages across all of the user's channels. Parameters:
+- `q` (required) – the phrase to search for (ILIKE + full-text search)
+- `limit` (optional, default 50, max 200) – number of results
 
-Zwraca tablicę obiektów Message z dodatkowym `channel_name` i `is_direct`.
+Returns an array of Message objects with an additional `channel_name` and `is_direct`.
 
 ---
 
-## Budowanie instalatorów
+## API – message history (pagination)
+
+```
+GET /api/channels/{channel_id}/messages?limit=50&before=<RFC3339>
+Authorization: Bearer <JWT>
+```
+
+Returns a page of messages (ascending by time). Parameters:
+- `limit` (optional, default 50, max 200) – page size
+- `before` (optional) – return messages strictly older than this timestamp;
+  pass the oldest loaded message's `created_at` to load the previous page.
+
+The client shows a **"Load earlier messages"** button that uses this cursor.
+
+---
+
+## Building installers
 
 ```bash
-# Windows (.msi) – na Windows
+# Windows (.msi) – on Windows
 cd client && npm install && npm run tauri:build
 
-# Linux AppImage (wszystkie dystrybucje) – przez Docker
+# Linux AppImage (all distributions) – via Docker
 cd build-scripts
 docker build -f Dockerfile.linux -t firmatek-linux ../
 docker run --rm -v "$(pwd)/output:/output" firmatek-linux
@@ -330,8 +385,7 @@ docker run --rm -v "$(pwd)/output:/output" firmatek-rpm
 
 ## Backup
 
-Dane są w `./data/` – wystarczy jeden folder:
+All data lives in `./data/` – a single folder:
 ```bash
 tar -czf backup-$(date +%Y%m%d).tar.gz data/
 ```
-

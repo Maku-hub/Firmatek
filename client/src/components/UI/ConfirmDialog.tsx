@@ -1,4 +1,5 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
+import { t } from '../../i18n'
 
 interface Props {
   title: string
@@ -11,27 +12,33 @@ interface Props {
 }
 
 export default function ConfirmDialog({
-  title, message, confirmLabel = 'OK', cancelLabel = 'Anuluj',
+  title, message, confirmLabel = 'OK', cancelLabel = t('confirm.cancel'),
   danger = false, onConfirm, onCancel,
 }: Props) {
-  // Zamknij na Escape
+  const confirmRef = useRef<HTMLButtonElement>(null)
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onCancel()
-      if (e.key === 'Enter') onConfirm()
+      // Enter confirms only for non-destructive dialogs, so an accidental Enter
+      // can't trigger a `danger` action (e.g. "Leave channel").
+      if (e.key === 'Enter' && !danger) onConfirm()
     }
     window.addEventListener('keydown', handler)
+    // Focus the safe (cancel) side for danger dialogs, otherwise the confirm.
+    confirmRef.current?.focus()
     return () => window.removeEventListener('keydown', handler)
-  }, [onConfirm, onCancel])
+  }, [onConfirm, onCancel, danger])
 
   return (
     <div style={s.overlay} onClick={onCancel}>
-      <div style={s.dialog} onClick={(e) => e.stopPropagation()}>
+      <div style={s.dialog} onClick={(e) => e.stopPropagation()}
+        role="dialog" aria-modal="true" aria-label={title}>
         <div style={s.title}>{title}</div>
         <div style={s.message}>{message}</div>
         <div style={s.buttons}>
           <button style={s.cancelBtn} onClick={onCancel}>{cancelLabel}</button>
-          <button style={{ ...s.confirmBtn, background: danger ? '#ef4444' : '#6366f1' }} onClick={onConfirm}>
+          <button ref={confirmRef} style={{ ...s.confirmBtn, background: danger ? '#ef4444' : '#6366f1' }} onClick={onConfirm}>
             {confirmLabel}
           </button>
         </div>

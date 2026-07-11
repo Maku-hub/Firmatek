@@ -8,7 +8,7 @@ use tauri_plugin_autostart::MacosLauncher;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // ─── Jedna instancja ───────────────────────────────────────────────
+        // ─── Single instance ───────────────────────────────────────────────
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
@@ -18,12 +18,12 @@ pub fn run() {
         }))
         // ─── Autostart ────────────────────────────────────────────────────
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
-        // ─── Powiadomienia systemowe ──────────────────────────────────────
+        // ─── System notifications ──────────────────────────────────────────
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // ─── System tray ───────────────────────────────────────────────
-            let show = MenuItem::with_id(app, "show", "Pokaż Firmatek", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Zamknij aplikację", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "Show Firmatek", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
 
             TrayIconBuilder::new()
@@ -58,12 +58,12 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // X = ukryj do tray
+            // X = hide to the tray
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
             }
         })
         .run(tauri::generate_context!())
-        .expect("błąd podczas uruchamiania aplikacji Tauri");
+        .expect("error while running the Tauri application");
 }

@@ -11,28 +11,28 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// NotifyRequest – payload dla endpointu powiadomień CI/CD
+// NotifyRequest – payload for the CI/CD notification endpoint
 type NotifyRequest struct {
-	Channel string `json:"channel" binding:"required"` // nazwa kanału lub ID
+	Channel string `json:"channel" binding:"required"` // channel name or ID
 	Message string `json:"message" binding:"required"`
-	// Opcjonalne pola dla lepszego formatowania
-	Title  string `json:"title"`   // np. "✅ Deploy zakończony"
+	// Optional fields for nicer formatting
+	Title  string `json:"title"`   // e.g. "✅ Deploy finished"
 	Level  string `json:"level"`   // info | success | warning | error
-	Footer string `json:"footer"`  // np. "Pipeline #123 | main"
+	Footer string `json:"footer"`  // e.g. "Pipeline #123 | main"
 }
 
-// Notify – endpoint do wysyłania wiadomości z zewnętrznych systemów
+// Notify – endpoint for sending messages from external systems
 // POST /api/notify
-// Header: X-Notify-Token: <NOTIFY_TOKEN z .env>
+// Header: X-Notify-Token: <NOTIFY_TOKEN from .env>
 func (h *Handlers) Notify(c *gin.Context) {
-	// Sprawdź token powiadomień
+	// Check the notification token
 	token := c.GetHeader("X-Notify-Token")
 	if token == "" {
 		token = c.Query("token")
 	}
 	expected := h.cfg.NotifyToken
 	if expected == "" || token != expected {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "nieprawidłowy token powiadomień"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid notification token"})
 		return
 	}
 
@@ -44,17 +44,17 @@ func (h *Handlers) Notify(c *gin.Context) {
 
 	bgCtx := context.Background()
 
-	// Znajdź kanał po nazwie lub ID
+	// Find the channel by name or ID
 	channelID, err := h.resolveChannel(bgCtx, req.Channel)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "kanał nie znaleziony: " + req.Channel})
+		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found: " + req.Channel})
 		return
 	}
 
-	// Zbuduj treść wiadomości
+	// Build the message content
 	content := buildNotifyMessage(req)
 
-	// Zapisz wiadomość w bazie jako nadaną przez "system"
+	// Store the message in the database as sent by "system"
 	systemUserID := h.getOrCreateSystemUser(bgCtx)
 
 	var msgID string
@@ -64,7 +64,7 @@ func (h *Handlers) Notify(c *gin.Context) {
 		channelID, systemUserID, content,
 	).Scan(&msgID)
 
-	// Wyślij do wszystkich online członków kanału przez WebSocket
+	// Deliver to all channel members (online via WebSocket, offline via the Redis queue)
 	outMsg := &models.WSMessage{
 		Type:      models.WSTypeChatMessage,
 		ChannelID: channelID,
@@ -118,18 +118,19 @@ func buildNotifyMessage(req NotifyRequest) string {
 	return sb.String()
 }
 
-// resolveChannel – szuka kanału po ID lub nazwie
+// resolveChannel – looks up a channel by ID or name.
+// id is a UUID column, so we compare its text form to avoid a cast error when
+// nameOrID is a plain channel name rather than a valid UUID.
 func (h *Handlers) resolveChannel(ctx context.Context, nameOrID string) (string, error) {
-	// Najpierw spróbuj jako ID
 	var id string
 	err := h.db.Pool.QueryRow(ctx,
-		`SELECT id FROM channels WHERE id=$1 OR name=$2 LIMIT 1`,
-		nameOrID, nameOrID,
+		`SELECT id FROM channels WHERE id::text=$1 OR name=$1 LIMIT 1`,
+		nameOrID,
 	).Scan(&id)
 	return id, err
 }
 
-// getOrCreateSystemUser – zwraca ID użytkownika systemowego
+// getOrCreateSystemUser – returns the system user's ID
 func (h *Handlers) getOrCreateSystemUser(ctx context.Context) string {
 	var id string
 	err := h.db.Pool.QueryRow(ctx,
@@ -137,7 +138,7 @@ func (h *Handlers) getOrCreateSystemUser(ctx context.Context) string {
 	if err == nil {
 		return id
 	}
-	// Utwórz
+	// Create it
 	_ = h.db.Pool.QueryRow(ctx, `
 		INSERT INTO users (username, display_name, password_hash, avatar_color)
 		VALUES ('system', '🤖 System', 'SYSTEM_NO_LOGIN', '#374151')

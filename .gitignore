@@ -1,4 +1,4 @@
-# Dane produkcyjne (nie commitować!)
+# Production data (do not commit!)
 data/
 
 # Env
@@ -10,10 +10,12 @@ client/dist/
 
 # Rust/Tauri build
 client/src-tauri/target/
+# Tauri-generated ACL/capability schemas (regenerated on build)
+client/src-tauri/gen/schemas/
 
 # Go build
 server/firmatek-server
 
-# Archiwum
+# Archives
 *.zip
 *.tar.gz

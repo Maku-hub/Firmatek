@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Hub zarządza wszystkimi aktywnymi połączeniami WebSocket
+// Hub manages all active WebSocket connections
 type Hub struct {
 	mu      sync.RWMutex
 	clients map[string]*Client // userID → Client
@@ -42,7 +42,7 @@ func NewHub(c *cache.Cache, db interface{ GetPool() *pgxpool.Pool }) *Hub {
 	}
 }
 
-// Run – główna pętla huba, uruchamiana w goroutine
+// Run – the hub's main loop, started in a goroutine
 func (h *Hub) Run() {
 	for {
 		select {
@@ -54,56 +54,66 @@ func (h *Hub) Run() {
 			ctx := context.Background()
 			_ = h.cache.SetUserOnline(ctx, client.UserID)
 
-			// Dostarczamy zakolejkowane wiadomości
+			// Deliver any queued messages
 			go h.deliverOfflineMessages(client)
 
-			// Broadcast: ten użytkownik jest online
+			// Broadcast: this user is online
 			h.broadcastUserStatus(client.UserID, client.DisplayName, true, time.Time{})
-			fmt.Printf("[Hub] Zarejestrowano: %s (%s)\n", client.DisplayName, client.UserID)
+			fmt.Printf("[Hub] Registered: %s (%s)\n", client.DisplayName, client.UserID)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
+			removed := false
 			if existing, ok := h.clients[client.UserID]; ok && existing == client {
 				delete(h.clients, client.UserID)
+				removed = true
 			}
 			h.mu.Unlock()
 
+			client.closeSend()
+
+			// If a newer connection already replaced this one, the user is still
+			// online – don't flip their status or last_seen.
+			if !removed {
+				fmt.Printf("[Hub] Stale connection closed (replaced): %s\n", client.UserID)
+				continue
+			}
+
 			ctx := context.Background()
 			_ = h.cache.SetUserOffline(ctx, client.UserID)
-			close(client.send)
 
-			// Zaktualizuj last_seen w bazie
+			// Update last_seen in the database
 			now := time.Now()
 			if h.db != nil {
 				_, _ = h.db.Exec(ctx, `UPDATE users SET last_seen=$1 WHERE id=$2`, now, client.UserID)
 			}
 
-			// Broadcast: offline z aktualnym timestampem
+			// Broadcast: offline with the current timestamp
 			h.broadcastUserStatus(client.UserID, client.DisplayName, false, now)
-			fmt.Printf("[Hub] Wyrejestrowano: %s (%s)\n", client.DisplayName, client.UserID)
+			fmt.Printf("[Hub] Unregistered: %s (%s)\n", client.DisplayName, client.UserID)
 
 		case msg := <-h.send:
 			h.mu.RLock()
 			client, online := h.clients[msg.targetUserID]
 			h.mu.RUnlock()
 
-			if online {
-				select {
-				case client.send <- msg.data:
-				default:
-					// Bufor klienta pełny – zamknij
-					h.mu.Lock()
+			if online && !client.trySend(msg.data) {
+				// Buffer full (or already closed) – drop the client so a stuck
+				// connection cannot block the hub. closeSend() is idempotent.
+				h.mu.Lock()
+				if existing, ok := h.clients[msg.targetUserID]; ok && existing == client {
 					delete(h.clients, msg.targetUserID)
-					h.mu.Unlock()
-					close(client.send)
 				}
+				h.mu.Unlock()
+				client.closeSend()
+				fmt.Printf("[Hub] Evicted slow client (buffer full): %s\n", client.UserID)
 			}
 		}
 	}
 }
 
-// SendToUser – wysyła wiadomość do konkretnego użytkownika
-// Jeśli offline, kolejkuje w Redis
+// SendToUser – sends a message to a specific user
+// If the user is offline, the message is queued in Redis
 func (h *Hub) SendToUser(userID string, msg *models.WSMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -117,12 +127,12 @@ func (h *Hub) SendToUser(userID string, msg *models.WSMessage) {
 	if online {
 		h.send <- &targetedMessage{targetUserID: userID, data: data}
 	} else {
-		// Kolejkuj w Redis dla offline użytkownika
+		// Queue in Redis for the offline user
 		_ = h.cache.EnqueueOfflineMessage(context.Background(), userID, msg)
 	}
 }
 
-// SendToAll – broadcast do wszystkich połączonych klientów
+// SendToAll – broadcasts to all connected clients
 func (h *Hub) SendToAll(msg *models.WSMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -133,14 +143,11 @@ func (h *Hub) SendToAll(msg *models.WSMessage) {
 	defer h.mu.RUnlock()
 
 	for _, client := range h.clients {
-		select {
-		case client.send <- data:
-		default:
-		}
+		client.trySend(data)
 	}
 }
 
-// SendToChannel – wysyła do wszystkich członków kanału (przekazana lista)
+// SendToChannel – sends to all members of a channel (from the provided list)
 func (h *Hub) SendToChannel(memberIDs []string, msg *models.WSMessage, excludeUserID string) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -155,20 +162,17 @@ func (h *Hub) SendToChannel(memberIDs []string, msg *models.WSMessage, excludeUs
 			continue
 		}
 		if client, ok := h.clients[uid]; ok {
-			select {
-			case client.send <- data:
-			default:
-			}
+			client.trySend(data)
 		}
 	}
 }
 
-// Register – rejestruje klienta w hubie (publiczne API)
+// Register – registers a client with the hub (public API)
 func (h *Hub) Register(client *Client) {
 	h.register <- client
 }
 
-// IsOnline – czy użytkownik jest aktualnie połączony
+// IsOnline – whether the user is currently connected
 func (h *Hub) IsOnline(userID string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -176,7 +180,7 @@ func (h *Hub) IsOnline(userID string) bool {
 	return ok
 }
 
-// OnlineUsers – zwraca slice aktualnie online userIDs
+// OnlineUsers – returns a slice of the currently online user IDs
 func (h *Hub) OnlineUsers() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -212,11 +216,9 @@ func (h *Hub) deliverOfflineMessages(client *Client) {
 	}
 
 	for _, data := range msgs {
-		select {
-		case client.send <- data:
-		default:
+		if !client.trySend(data) {
 			return
 		}
 	}
-	fmt.Printf("[Hub] Dostarczono %d zakolejkowanych wiadomości dla %s\n", len(msgs), client.UserID)
+	fmt.Printf("[Hub] Delivered %d queued messages to %s\n", len(msgs), client.UserID)
 }

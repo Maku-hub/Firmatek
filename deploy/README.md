@@ -1,58 +1,60 @@
-# Firmatek – Wdrożenie serwera
+# Firmatek – Server deployment
 
-Ten folder zawiera **tylko to co potrzebne do uruchomienia serwera**.
-Kod źródłowy klienta nie jest tu potrzebny.
+Deployment instructions for running just the server. The canonical
+`docker-compose.yml`, `.env.example` and `coturn/turnserver.conf` live at the
+**repository root** (single source of truth) — this folder holds only these
+instructions, not copies of those files.
 
-## Struktura na serwerze
+## Layout on the server
 
 ```
 /opt/firmatek/
-├── server/              ← skopiuj z repozytorium
-├── docker-compose.yml   ← ten plik
-├── .env                 ← uzupełniony .env.example
+├── server/              ← copy from the repository
+├── docker-compose.yml   ← this file
+├── .env                 ← a filled-in .env.example
 ├── coturn/
 │   └── turnserver.conf
-└── data/                ← tworzy się automatycznie
+└── data/                ← created automatically
     ├── postgres/
     └── redis/
 ```
 
-## Kroki wdrożenia
+## Deployment steps
 
 ```bash
-# 1. Na maszynie deweloperskiej – spakuj serwer
-cd /ścieżka/do/firmatek_clean
-tar -czf firmatek-server.tar.gz server/ deploy/ docker-compose.yml .env.example coturn/
+# 1. On the development machine – package the server (root files only)
+cd /path/to/firmatek
+tar -czf firmatek-server.tar.gz server/ docker-compose.yml .env.example coturn/
 
-# 2. Wgraj na serwer
-scp firmatek-server.tar.gz user@serwer:/opt/firmatek/
+# 2. Upload to the server
+scp firmatek-server.tar.gz user@server:/opt/firmatek/
 
-# 3. Na serwerze
-ssh user@serwer
+# 3. On the server
+ssh user@server
 cd /opt/firmatek
 tar -xzf firmatek-server.tar.gz
 cp .env.example .env
-nano .env    # uzupełnij hasła i konfigurację LDAP
+nano .env    # fill in the passwords and LDAP configuration
 
-# 4. Uruchom
+# 4. Start
 docker compose up -d
 
-# 5. Sprawdź
+# 5. Verify
 docker compose ps
 docker compose logs -f server
 ```
 
-## Backup danych
+## Data backup
 
-Dane są w folderze `./data/` – wystarczy go zbackupować:
+All data lives in the `./data/` folder – just back it up:
 ```bash
 tar -czf backup-$(date +%Y%m%d).tar.gz data/
 ```
 
-## Aktualizacja serwera
+## Updating the server
 
 ```bash
 docker compose down
-# wgraj nowy kod server/
+# upload the new server/ code
 docker compose up -d --build
 ```

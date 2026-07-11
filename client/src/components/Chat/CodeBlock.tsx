@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { createHighlighter } from 'shiki'
+import { t } from '../../i18n'
 
 interface Props {
   code: string
@@ -34,7 +35,7 @@ export default function CodeBlock({ code, language, filename }: Props) {
         const result = hl.codeToHtml(code, { lang: language, theme: 'one-dark-pro' })
         setHtml(result)
       } catch {
-        // fallback jeśli język nieobsługiwany
+        // fallback if the language is unsupported
         setHtml(`<pre style="color:#abb2bf;background:#282c34;padding:16px;border-radius:8px;overflow-x:auto"><code>${escapeHtml(code)}</code></pre>`)
       }
     })
@@ -52,7 +53,7 @@ export default function CodeBlock({ code, language, filename }: Props) {
       <div style={styles.header}>
         <span style={styles.lang}>{filename ?? language}</span>
         <button style={styles.copyBtn} onClick={handleCopy}>
-          {copied ? '✓ Skopiowano' : '📋 Kopiuj'}
+          {copied ? t('code.copied') : t('code.copy')}
         </button>
       </div>
       {html ? (

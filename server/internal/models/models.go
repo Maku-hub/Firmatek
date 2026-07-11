@@ -21,7 +21,7 @@ type Channel struct {
 	Members   []User    `json:"members,omitempty"`
 }
 
-// MessageType określa typ wiadomości
+// MessageType defines the type of a message
 type MessageType string
 
 const (
@@ -44,19 +44,19 @@ type Message struct {
 	Delivered bool            `json:"delivered"`
 }
 
-// MessageMeta – dodatkowe dane zależne od typu wiadomości
+// MessageMeta – extra data that depends on the message type
 type MessageMeta struct {
-	// Kod
+	// Code
 	Language string `json:"language,omitempty"`
 	Filename string `json:"filename,omitempty"`
 
-	// Plik inline (mały obraz/screen)
+	// Inline file (small image/screenshot)
 	MimeType  string `json:"mime_type,omitempty"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
 	Width     int    `json:"width,omitempty"`
 	Height    int    `json:"height,omitempty"`
 
-	// Plik w buforze offline
+	// File stored in the offline buffer
 	FileID      string `json:"file_id,omitempty"`
 	OrigName    string `json:"orig_name,omitempty"`
 	SHA256      string `json:"sha256,omitempty"`
@@ -65,7 +65,7 @@ type MessageMeta struct {
 
 // --- WebSocket message protocol ---
 
-// WSMessageType – typy wiadomości WebSocket
+// WSMessageType – WebSocket message types
 type WSMessageType string
 
 const (
@@ -73,11 +73,11 @@ const (
 	WSTypeChatMessage  WSMessageType = "chat_message"
 	WSTypeMessageAck   WSMessageType = "message_ack"
 
-	// Statusy
+	// Statuses
 	WSTypeUserStatus   WSMessageType = "user_status"
 	WSTypeTyping       WSMessageType = "typing"
-	WSTypeUserNew      WSMessageType = "user_new"        // nowy użytkownik w systemie
-	WSTypeChannelAdded WSMessageType = "channel_added"   // użytkownik dodany do kanału
+	WSTypeUserNew      WSMessageType = "user_new"        // new user in the system
+	WSTypeChannelAdded WSMessageType = "channel_added"   // user added to a channel
 
 	// WebRTC signaling
 	WSTypeRTCOffer     WSMessageType = "rtc_offer"
@@ -85,20 +85,24 @@ const (
 	WSTypeICECandidate WSMessageType = "ice_candidate"
 	WSTypeRTCDecline   WSMessageType = "rtc_decline"
 
-	// Błędy
+	// Heartbeat (application-level keepalive)
+	WSTypePing         WSMessageType = "ping"
+	WSTypePong         WSMessageType = "pong"
+
+	// Errors
 	WSTypeError        WSMessageType = "error"
 )
 
-// WSMessage – format ramki WebSocket
+// WSMessage – the WebSocket frame format
 type WSMessage struct {
 	Type      WSMessageType `json:"type"`
 	Payload   interface{}   `json:"payload"`
 	SenderID  string        `json:"sender_id,omitempty"`
-	TargetID  string        `json:"target_id,omitempty"` // dla P2P signaling
+	TargetID  string        `json:"target_id,omitempty"` // for P2P signaling
 	ChannelID string        `json:"channel_id,omitempty"`
 }
 
-// Payload dla statusu użytkownika
+// Payload for a user status update
 type UserStatusPayload struct {
 	UserID      string `json:"user_id"`
 	DisplayName string `json:"display_name"`

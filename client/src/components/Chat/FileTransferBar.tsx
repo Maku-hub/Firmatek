@@ -1,3 +1,5 @@
+import { t } from '../../i18n'
+
 interface Props {
   transferId: string
   filename: string
@@ -9,14 +11,14 @@ interface Props {
 
 export default function FileTransferBar({ filename, progress, status, direction, onCancel }: Props) {
   const statusLabels: Record<string, string> = {
-    connecting: '🔗 Nawiązywanie połączenia P2P…',
-    transferring: direction === 'send' ? '⬆ Wysyłanie' : '⬇ Odbieranie',
-    done: '✅ Zakończono',
-    error: '❌ Błąd transferu',
-    incoming: '📨 Przychodzący plik',
-    declined: '🚫 Odbiorca odrzucił',
-    cancelled: '⛔ Anulowano',
-    timeout: '⏱ Brak odpowiedzi – timeout',
+    connecting: t('transfer.connecting'),
+    transferring: direction === 'send' ? t('transfer.sending') : t('transfer.receiving'),
+    done: t('transfer.done'),
+    error: t('transfer.error'),
+    incoming: t('transfer.incoming'),
+    declined: t('transfer.declined'),
+    cancelled: t('transfer.cancelled'),
+    timeout: t('transfer.timeout'),
   }
 
   const color = status === 'done' ? '#22c55e'
@@ -35,7 +37,7 @@ export default function FileTransferBar({ filename, progress, status, direction,
             {status === 'transferring' && ` ${progress}%`}
           </span>
           {showCancel && onCancel && (
-            <button style={styles.cancelBtn} onClick={onCancel} title="Anuluj transfer">✕</button>
+            <button style={styles.cancelBtn} onClick={onCancel} title={t('transfer.cancel')}>✕</button>
           )}
         </div>
       </div>

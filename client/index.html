@@ -1,19 +1,9 @@
 <!doctype html>
-<html lang="pl">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Firmatek</title>
-    <script>
-      // Wyłącz domyślne menu kontekstowe przeglądarki
-      document.addEventListener('contextmenu', (e) => e.preventDefault())
-      // Wyłącz skróty deweloperskie
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'F5' || (e.ctrlKey && e.key === 'r') || (e.ctrlKey && e.key === 'R')) {
-          e.preventDefault()
-        }
-      })
-    </script>
   </head>
   <body>
     <div id="root"></div>

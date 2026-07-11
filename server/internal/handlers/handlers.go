@@ -14,6 +14,7 @@ import (
 	"firmatek/server/internal/config"
 	"firmatek/server/internal/database"
 	"firmatek/server/internal/hub"
+	"firmatek/server/internal/middleware"
 	"firmatek/server/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -22,21 +23,51 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
-}
-
 type Handlers struct {
-	db      *database.DB
-	hub     *hub.Hub
-	cache   *cache.Cache
-	cfg     *config.Config
+	db           *database.DB
+	hub          *hub.Hub
+	cache        *cache.Cache
+	cfg          *config.Config
+	upgrader     websocket.Upgrader
+	msgLimiter   *middleware.RateLimiter // per-user WebSocket chat-message limiter
+	loginLimiter *middleware.RateLimiter // per-username brute-force protection
 }
 
 func New(db *database.DB, h *hub.Hub, c *cache.Cache, cfg *config.Config) *Handlers {
-	return &Handlers{db: db, hub: h, cache: c, cfg: cfg}
+	handlers := &Handlers{
+		db: db, hub: h, cache: c, cfg: cfg,
+		msgLimiter:   middleware.NewRateLimiter(120, time.Minute, 30),
+		loginLimiter: middleware.NewRateLimiter(10, time.Minute, 10),
+	}
+	handlers.upgrader = websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		CheckOrigin:     handlers.checkWSOrigin,
+	}
+	return handlers
+}
+
+// checkWSOrigin gates WebSocket upgrades. With ALLOWED_ORIGINS unset, all
+// origins are allowed (default). When set, only listed origins are permitted,
+// plus native-client origins (empty, or the Tauri webview schemes) so the
+// desktop app is never blocked.
+func (h *Handlers) checkWSOrigin(r *http.Request) bool {
+	if len(h.cfg.AllowedOrigins) == 0 {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" ||
+		strings.HasPrefix(origin, "tauri://") ||
+		strings.HasPrefix(origin, "http://tauri.localhost") ||
+		strings.HasPrefix(origin, "https://tauri.localhost") {
+		return true
+	}
+	for _, allowed := range h.cfg.AllowedOrigins {
+		if origin == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -48,9 +79,9 @@ type RegisterRequest struct {
 }
 
 func (h *Handlers) Register(c *gin.Context) {
-	// Zablokuj rejestrację jeśli wyłączona lub LDAP włączony bez lokalnych kont
+	// Block registration if it is disabled, or if LDAP is enabled without local accounts
 	if !h.cfg.LDAP.EnableRegistration {
-		c.JSON(http.StatusForbidden, gin.H{"error": "rejestracja kont lokalnych jest wyłączona – używaj Active Directory"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "local account registration is disabled – use Active Directory"})
 		return
 	}
 
@@ -62,7 +93,7 @@ func (h *Handlers) Register(c *gin.Context) {
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd serwera"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server error"})
 		return
 	}
 
@@ -79,10 +110,10 @@ func (h *Handlers) Register(c *gin.Context) {
 	).Scan(&userID)
 	if err != nil {
 		if strings.Contains(err.Error(), "unique") {
-			c.JSON(http.StatusConflict, gin.H{"error": "login jest już zajęty"})
+			c.JSON(http.StatusConflict, gin.H{"error": "username is already taken"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd zapisu"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save"})
 		return
 	}
 	h.ensureGeneralChannel(bgCtx, userID)
@@ -92,7 +123,7 @@ func (h *Handlers) Register(c *gin.Context) {
 
 	newUser := models.User{ID: userID, Username: username, DisplayName: displayName, AvatarColor: color, Online: false}
 
-	// Broadcast do wszystkich – nowy użytkownik w systemie
+	// Broadcast to everyone – a new user in the system
 	h.hub.SendToAll(&models.WSMessage{Type: models.WSTypeUserNew, Payload: newUser})
 
 	c.JSON(http.StatusCreated, gin.H{"token": token, "user_id": userID, "user": newUser})
@@ -113,18 +144,26 @@ func (h *Handlers) Login(c *gin.Context) {
 	bgCtx := context.Background()
 	username := strings.ToLower(strings.TrimSpace(req.Username))
 
+	// Per-account brute-force protection (independent of source IP, so a shared
+	// office NAT is not a problem).
+	if !h.loginLimiter.Allow(username) {
+		c.Header("Retry-After", "60")
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many login attempts – try again later"})
+		return
+	}
+
 	// ─── LDAP auth ────────────────────────────────────────────────────────
 	if h.cfg.LDAP.Enabled {
 		ldapInfo, err := AuthenticateLDAP(&h.cfg.LDAP, req.Username, req.Password)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "nieprawidłowy login lub hasło (AD)"})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password (AD)"})
 			return
 		}
 
-		// Auto-utwórz lub pobierz użytkownika z DB
+		// Auto-create or fetch the user from the DB
 		userID, displayName, avatarColor, err := h.upsertLDAPUser(bgCtx, ldapInfo)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd synchronizacji z AD"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "AD synchronization error"})
 			return
 		}
 
@@ -137,7 +176,7 @@ func (h *Handlers) Login(c *gin.Context) {
 		return
 	}
 
-	// ─── Lokalna auth ─────────────────────────────────────────────────────
+	// ─── Local auth ───────────────────────────────────────────────────────
 	var user models.User
 	var passwordHash string
 	err := h.db.Pool.QueryRow(bgCtx, `
@@ -145,11 +184,11 @@ func (h *Handlers) Login(c *gin.Context) {
 		FROM users WHERE username=$1`, username,
 	).Scan(&user.ID, &user.Username, &user.DisplayName, &user.AvatarColor, &passwordHash)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "nieprawidłowy login lub hasło"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "nieprawidłowy login lub hasło"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
 		return
 	}
 	_, _ = h.db.Pool.Exec(bgCtx, `UPDATE users SET last_seen=NOW() WHERE id=$1`, user.ID)
@@ -158,7 +197,7 @@ func (h *Handlers) Login(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
 }
 
-// GetMe – zwraca dane zalogowanego użytkownika (do auto-login)
+// GetMe – returns the logged-in user's data (used for auto-login)
 func (h *Handlers) GetMe(c *gin.Context) {
 	userID := c.GetString(auth.UserIDKey)
 	var user models.User
@@ -166,14 +205,14 @@ func (h *Handlers) GetMe(c *gin.Context) {
 		SELECT id, username, display_name, avatar_color FROM users WHERE id=$1`, userID,
 	).Scan(&user.ID, &user.Username, &user.DisplayName, &user.AvatarColor)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "użytkownik nie znaleziony"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not found"})
 		return
 	}
 	user.Online = true
 	c.JSON(http.StatusOK, user)
 }
 
-// GetAuthConfig – informuje klienta o trybie auth (LDAP vs lokalne + czy rejestracja)
+// GetAuthConfig – tells the client about the auth mode (LDAP vs local + whether registration is enabled)
 func (h *Handlers) GetAuthConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ldap_enabled":        h.cfg.LDAP.Enabled,
@@ -188,7 +227,7 @@ func (h *Handlers) GetUsers(c *gin.Context) {
 	rows, err := h.db.Pool.Query(context.Background(), `
 		SELECT id, username, display_name, avatar_color, last_seen FROM users ORDER BY display_name`)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd bazy"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
 	}
 	defer rows.Close()
@@ -216,7 +255,7 @@ func (h *Handlers) GetChannels(c *gin.Context) {
 		WHERE cm.user_id=$1
 		ORDER BY ch.is_direct, ch.name`, userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd bazy"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
 	}
 	defer rows.Close()
@@ -236,7 +275,7 @@ func (h *Handlers) GetChannelMembers(c *gin.Context) {
 	channelID := c.Param("channel_id")
 	userID := c.GetString(auth.UserIDKey)
 	if !h.isMember(context.Background(), channelID, userID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "brak dostępu"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 	rows, err := h.db.Pool.Query(context.Background(), `
@@ -244,7 +283,7 @@ func (h *Handlers) GetChannelMembers(c *gin.Context) {
 		FROM users u JOIN channel_members cm ON cm.user_id=u.id
 		WHERE cm.channel_id=$1 ORDER BY u.display_name`, channelID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd bazy"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
 	}
 	defer rows.Close()
@@ -275,13 +314,13 @@ func (h *Handlers) CreateChannel(c *gin.Context) {
 	}
 	bgCtx := context.Background()
 	tx, err := h.db.Pool.Begin(bgCtx)
-	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd transakcji"}); return }
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "transaction error"}); return }
 	defer tx.Rollback(bgCtx)
 
 	var channelID string
 	if err := tx.QueryRow(bgCtx, `INSERT INTO channels (name, created_by) VALUES ($1,$2) RETURNING id`,
 		strings.TrimSpace(req.Name), userID).Scan(&channelID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd tworzenia kanału"}); return
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create channel"}); return
 	}
 	seen := map[string]bool{}
 	for _, uid := range append([]string{userID}, req.Members...) {
@@ -289,7 +328,7 @@ func (h *Handlers) CreateChannel(c *gin.Context) {
 		seen[uid] = true
 		_, _ = tx.Exec(bgCtx, `INSERT INTO channel_members (channel_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, channelID, uid)
 	}
-	if err := tx.Commit(bgCtx); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd commit"}); return }
+	if err := tx.Commit(bgCtx); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed"}); return }
 	c.JSON(http.StatusCreated, gin.H{"channel_id": channelID, "name": strings.TrimSpace(req.Name)})
 }
 
@@ -303,12 +342,12 @@ func (h *Handlers) AddChannelMember(c *gin.Context) {
 	bgCtx := context.Background()
 	var req AddMemberRequest
 	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()}); return }
-	if !h.isMember(bgCtx, channelID, requesterID) { c.JSON(http.StatusForbidden, gin.H{"error": "brak dostępu"}); return }
+	if !h.isMember(bgCtx, channelID, requesterID) { c.JSON(http.StatusForbidden, gin.H{"error": "access denied"}); return }
 	_, err := h.db.Pool.Exec(bgCtx,
 		`INSERT INTO channel_members (channel_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, channelID, req.UserID)
-	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd dodawania"}); return }
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add member"}); return }
 
-	// Powiadom dodanego użytkownika o nowym kanale przez WS
+	// Notify the added user about the new channel over WS
 	var ch models.Channel
 	if err := h.db.Pool.QueryRow(bgCtx, `SELECT id, name, is_direct, created_by, created_at FROM channels WHERE id=$1`, channelID).Scan(
 		&ch.ID, &ch.Name, &ch.IsDirect, &ch.CreatedBy, &ch.CreatedAt); err == nil {
@@ -318,22 +357,22 @@ func (h *Handlers) AddChannelMember(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// LeaveChannel – opuszcza kanał (nie dotyczy DM)
+// LeaveChannel – leaves a channel (does not apply to DMs)
 func (h *Handlers) LeaveChannel(c *gin.Context) {
 	channelID := c.Param("channel_id")
 	userID := c.GetString(auth.UserIDKey)
 	bgCtx := context.Background()
 
-	// Sprawdź czy to nie jest DM
+	// Check that this is not a DM
 	var isDirect bool
 	_ = h.db.Pool.QueryRow(bgCtx, `SELECT is_direct FROM channels WHERE id=$1`, channelID).Scan(&isDirect)
 	if isDirect {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "nie można opuścić wiadomości bezpośredniej"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot leave a direct message"})
 		return
 	}
 
 	_, err := h.db.Pool.Exec(bgCtx, `DELETE FROM channel_members WHERE channel_id=$1 AND user_id=$2`, channelID, userID)
-	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd opuszczania kanału"}); return }
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to leave channel"}); return }
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -352,31 +391,69 @@ func (h *Handlers) CreateDirectChannel(c *gin.Context) {
 	if err == nil { c.JSON(http.StatusOK, gin.H{"channel_id": existingID, "existing": true}); return }
 
 	channelName := fmt.Sprintf("dm:%s:%s", userID, targetID)
-	tx, _ := h.db.Pool.Begin(bgCtx)
+	tx, err := h.db.Pool.Begin(bgCtx)
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "transaction error"}); return }
 	defer tx.Rollback(bgCtx)
 	var channelID string
-	_ = tx.QueryRow(bgCtx, `INSERT INTO channels (name,is_direct,created_by) VALUES ($1,TRUE,$2) RETURNING id`, channelName, userID).Scan(&channelID)
-	for _, uid := range []string{userID, targetID} {
-		_, _ = tx.Exec(bgCtx, `INSERT INTO channel_members (channel_id,user_id) VALUES ($1,$2)`, channelID, uid)
+	if err := tx.QueryRow(bgCtx, `INSERT INTO channels (name,is_direct,created_by) VALUES ($1,TRUE,$2) RETURNING id`, channelName, userID).Scan(&channelID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create direct channel"}); return
 	}
-	_ = tx.Commit(bgCtx)
+	for _, uid := range []string{userID, targetID} {
+		if _, err := tx.Exec(bgCtx, `INSERT INTO channel_members (channel_id,user_id) VALUES ($1,$2)`, channelID, uid); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add direct channel member"}); return
+		}
+	}
+	if err := tx.Commit(bgCtx); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed"}); return }
+
+	// Notify the other participant so the new DM appears in their sidebar
+	// immediately (the creator adds it locally from this response).
+	var ch models.Channel
+	if err := h.db.Pool.QueryRow(bgCtx, `SELECT id, name, is_direct, created_by, created_at FROM channels WHERE id=$1`, channelID).Scan(
+		&ch.ID, &ch.Name, &ch.IsDirect, &ch.CreatedBy, &ch.CreatedAt); err == nil {
+		h.hub.SendToUser(targetID, &models.WSMessage{Type: models.WSTypeChannelAdded, Payload: ch})
+	}
+
 	c.JSON(http.StatusCreated, gin.H{"channel_id": channelID, "existing": false})
 }
 
 // ─── MESSAGES ─────────────────────────────────────────────────────────────────
 
+// GetMessages returns a page of messages for a channel, newest first internally
+// but sorted ascending in the response. Supports keyset pagination:
+//   ?limit=<1..200, default 50>   – page size
+//   ?before=<RFC3339 timestamp>   – return messages strictly older than this
+//                                   (pass the oldest loaded message's created_at
+//                                   to load the previous page)
 func (h *Handlers) GetMessages(c *gin.Context) {
 	channelID := c.Param("channel_id")
 	userID := c.GetString(auth.UserIDKey)
 	bgCtx := context.Background()
-	if !h.isMember(bgCtx, channelID, userID) { c.JSON(http.StatusForbidden, gin.H{"error": "brak dostępu"}); return }
+	if !h.isMember(bgCtx, channelID, userID) { c.JSON(http.StatusForbidden, gin.H{"error": "access denied"}); return }
 
-	rows, err := h.db.Pool.Query(bgCtx, `
+	limit := 50
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 { limit = v }
+	if limit > 200 { limit = 200 }
+
+	const base = `
 		SELECT m.id, m.channel_id, m.sender_id, m.type, m.content, m.metadata, m.created_at,
 		       u.display_name, u.username, u.avatar_color
 		FROM messages m JOIN users u ON u.id=m.sender_id
-		WHERE m.channel_id=$1 ORDER BY m.created_at DESC LIMIT 200`, channelID)
-	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd bazy"}); return }
+		WHERE m.channel_id=$1 `
+
+	query := base + `ORDER BY m.created_at DESC LIMIT $2`
+	args := []any{channelID, limit}
+	if before := strings.TrimSpace(c.Query("before")); before != "" {
+		ts, perr := time.Parse(time.RFC3339Nano, before)
+		if perr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'before' timestamp (expected RFC3339)"})
+			return
+		}
+		query = base + `AND m.created_at < $2 ORDER BY m.created_at DESC LIMIT $3`
+		args = []any{channelID, ts, limit}
+	}
+
+	rows, err := h.db.Pool.Query(bgCtx, query, args...)
+	if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"}); return }
 	defer rows.Close()
 
 	var messages []models.Message
@@ -398,13 +475,13 @@ func (h *Handlers) GetMessages(c *gin.Context) {
 	c.JSON(http.StatusOK, messages)
 }
 
-// SearchMessages – wyszukuje wiadomości po treści we wszystkich kanałach użytkownika
-// GET /api/messages/search?q=tekst&limit=50
+// SearchMessages – searches messages by content across all of the user's channels
+// GET /api/messages/search?q=text&limit=50
 func (h *Handlers) SearchMessages(c *gin.Context) {
 	userID := c.GetString(auth.UserIDKey)
 	query := strings.TrimSpace(c.Query("q"))
 	if query == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "parametr 'q' jest wymagany"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "the 'q' parameter is required"})
 		return
 	}
 
@@ -419,9 +496,9 @@ func (h *Handlers) SearchMessages(c *gin.Context) {
 
 	bgCtx := context.Background()
 
-	// Wyszukaj w kanałach, do których użytkownik należy
-	// Używa ILIKE jako fallback (prostsze, nie wymaga konfiguracji locale)
-	// oraz to_tsvector/plainto_tsquery dla dłuższych fraz
+	// Search within the channels the user belongs to.
+	// Uses ILIKE as a fallback (simpler, no locale configuration required)
+	// plus to_tsvector/plainto_tsquery for longer phrases.
 	rows, err := h.db.Pool.Query(bgCtx, `
 		SELECT m.id, m.channel_id, m.sender_id, m.type, m.content, m.metadata, m.created_at,
 		       u.display_name, u.username, u.avatar_color,
@@ -438,7 +515,7 @@ func (h *Handlers) SearchMessages(c *gin.Context) {
 		ORDER BY m.created_at DESC
 		LIMIT $3`, userID, query, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "błąd wyszukiwania"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "search error"})
 		return
 	}
 	defer rows.Close()
@@ -478,7 +555,7 @@ func (h *Handlers) WebSocket(c *gin.Context) {
 	userID := c.GetString(auth.UserIDKey)
 	username := c.GetString(auth.UsernameKey)
 	displayName := c.GetString(auth.DisplayNameKey)
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil { return }
 	client := hub.NewClient(h.hub, conn, userID, username, displayName, h.cache, h.routeWSMessage)
 	h.hub.Register(client)
@@ -494,10 +571,18 @@ func (h *Handlers) routeWSMessage(client *hub.Client, msg *models.WSMessage) {
 		if msg.TargetID != "" { msg.SenderID = client.UserID; h.hub.SendToUser(msg.TargetID, msg) }
 	case models.WSTypeTyping:
 		if msg.ChannelID != "" { h.hub.SendToChannel(h.getChannelMembers(msg.ChannelID), msg, client.UserID) }
+	case models.WSTypePing:
+		// Application-level heartbeat – reply so the client can detect a
+		// half-open connection and reconnect.
+		h.hub.SendToUser(client.UserID, &models.WSMessage{Type: models.WSTypePong})
 	}
 }
 
 func (h *Handlers) handleChatMessage(client *hub.Client, msg *models.WSMessage) {
+	// Drop messages from a user flooding the socket.
+	if !h.msgLimiter.Allow(client.UserID) {
+		return
+	}
 	payloadBytes, _ := json.Marshal(msg.Payload)
 	var payload struct {
 		Content   string              `json:"content"`
@@ -551,15 +636,15 @@ func (h *Handlers) getChannelMembers(channelID string) []string {
 
 func (h *Handlers) ensureGeneralChannel(ctx context.Context, userID string) {
 	var channelID string
-	err := h.db.Pool.QueryRow(ctx, `SELECT id FROM channels WHERE name='ogólny' LIMIT 1`).Scan(&channelID)
+	err := h.db.Pool.QueryRow(ctx, `SELECT id FROM channels WHERE name='general' LIMIT 1`).Scan(&channelID)
 	if err != nil {
 		newID := uuid.New().String()
-		if err2 := h.db.Pool.QueryRow(ctx, `INSERT INTO channels (id,name,created_by) VALUES ($1,'ogólny',$2) RETURNING id`, newID, userID).Scan(&channelID); err2 != nil { return }
+		if err2 := h.db.Pool.QueryRow(ctx, `INSERT INTO channels (id,name,created_by) VALUES ($1,'general',$2) RETURNING id`, newID, userID).Scan(&channelID); err2 != nil { return }
 	}
 	_, _ = h.db.Pool.Exec(ctx, `INSERT INTO channel_members (channel_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, channelID, userID)
 }
 
-// upsertLDAPUser – tworzy lub aktualizuje użytkownika z AD w lokalnej bazie
+// upsertLDAPUser – creates or updates an AD user in the local database
 func (h *Handlers) upsertLDAPUser(ctx context.Context, info *LDAPUserInfo) (userID, displayName, avatarColor string, err error) {
 	colors := []string{"#6366f1", "#ec4899", "#f59e0b", "#10b981", "#3b82f6", "#8b5cf6"}
 	color := colors[len(info.Username)%len(colors)]

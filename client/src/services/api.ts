@@ -17,7 +17,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || 'Błąd serwera')
+    throw new Error(err.error || 'Server error')
   }
   return res.json()
 }
@@ -72,8 +72,12 @@ export async function leaveChannel(channelId: string) {
   return request('DELETE', `/channels/${channelId}/leave`)
 }
 
-export async function getMessages(channelId: string): Promise<Message[]> {
-  return request<Message[]>('GET', `/channels/${channelId}/messages`)
+// getMessages returns a page of messages (default 50). Pass `before` (the
+// oldest loaded message's created_at) to load the previous page.
+export async function getMessages(channelId: string, before?: string, limit = 50): Promise<Message[]> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (before) params.set('before', before)
+  return request<Message[]>('GET', `/channels/${channelId}/messages?${params.toString()}`)
 }
 
 export interface SearchResult extends Message {
@@ -83,6 +87,17 @@ export interface SearchResult extends Message {
 
 export async function searchMessages(query: string, limit = 50): Promise<SearchResult[]> {
   return request<SearchResult[]>('GET', `/messages/search?q=${encodeURIComponent(query)}&limit=${limit}`)
+}
+
+export interface IceServersResponse {
+  ice_servers: RTCIceServer[]
+}
+
+// Fetches short-lived ICE/TURN servers from the server (credentials are
+// time-limited HMAC tokens, not a static secret baked into the client).
+export async function getIceServers(): Promise<RTCIceServer[]> {
+  const res = await request<IceServersResponse>('GET', '/turn-credentials')
+  return res.ice_servers
 }
 
 export function getWsURL(): string {

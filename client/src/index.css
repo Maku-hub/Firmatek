@@ -17,7 +17,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* AuthScreen ma własny scroll - pozwól mu działać */
+/* AuthScreen has its own scroll - let it work */
 .auth-scroll {
   overflow: auto !important;
 }
