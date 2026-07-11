@@ -20,17 +20,17 @@ jobs:
   test:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with: { go-version: '1.25', cache-dependency-path: server/go.sum }
       - name: Go tests (race) + vet
         working-directory: server
         run: |
           go test -race ./...
           go vet ./...
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: client/package-lock.json
       - name: Client typecheck + build
@@ -47,10 +47,10 @@ jobs:
     needs: test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: client/package-lock.json
       - uses: dtolnay/rust-toolchain@master
@@ -77,10 +77,10 @@ jobs:
       matrix:
         bundle: [appimage, deb, rpm]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: client/package-lock.json
       - uses: dtolnay/rust-toolchain@master
