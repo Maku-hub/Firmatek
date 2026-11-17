@@ -100,6 +100,19 @@ register/connect/send concurrently without errors.
 python tests/limits_concurrency_test.py
 ```
 
+### `audit_test.py` — validation, sessions and access rules
+
+Reserved `system` account, username/password validation, token refresh, DM
+rules (no self-DM, no third member, no duplicates under concurrent creation),
+channel invitations, delivery to every session of a user, refusal of forged
+`system` messages, delivery acknowledgements (a resend with the same
+`client_id` is stored and delivered once), LIKE wildcard escaping and that
+tokens never reach the access log (reads `docker logs firmatek-server`).
+
+```bash
+python tests/audit_test.py
+```
+
 ### `ldap_test.py` — Active Directory / LDAP login (T5)
 
 Requires the server running with LDAP enabled against a directory containing

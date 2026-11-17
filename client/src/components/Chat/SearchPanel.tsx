@@ -3,6 +3,7 @@ import { searchMessages, type SearchResult } from '../../services/api'
 import { useStore } from '../../store'
 import { dmPartnerId } from '../../lib/dm'
 import { t } from '../../i18n'
+import { formatMessageTime } from '../../lib/format'
 
 interface Props {
   onClose: () => void
@@ -15,28 +16,34 @@ export default function SearchPanel({ onClose, onGoToMessage }: Props) {
   const [loading, setLoading] = useState(false)
   const [searched, setSearched] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
-  const { users, currentUser } = useStore()
+  const users = useStore((s) => s.users)
+  const currentUserId = useStore((s) => s.currentUser?.id ?? '')
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Only the latest request may update the list; slower earlier ones are ignored.
+  const requestSeq = useRef(0)
 
   useEffect(() => {
     inputRef.current?.focus()
-    return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+      requestSeq.current++
+    }
   }, [])
 
   const doSearch = (q: string) => {
     if (debounceRef.current) clearTimeout(debounceRef.current)
-    if (!q.trim()) { setResults([]); setSearched(false); return }
+    const seq = ++requestSeq.current
+    if (!q.trim()) { setResults([]); setSearched(false); setLoading(false); return }
     debounceRef.current = setTimeout(async () => {
       setLoading(true)
+      let res: SearchResult[] = []
       try {
-        const res = await searchMessages(q.trim())
-        setResults(res)
-        setSearched(true)
-      } catch {
-        setResults([])
-      } finally {
-        setLoading(false)
-      }
+        res = await searchMessages(q.trim())
+      } catch { /* show as no results */ }
+      if (seq !== requestSeq.current) return
+      setResults(res)
+      setSearched(true)
+      setLoading(false)
     }, 300)
   }
 
@@ -47,7 +54,7 @@ export default function SearchPanel({ onClose, onGoToMessage }: Props) {
 
   const getDMName = (r: SearchResult): string => {
     if (!r.is_direct) return `# ${r.channel_name}`
-    const otherId = dmPartnerId(r.channel_name, currentUser?.id ?? '')
+    const otherId = dmPartnerId(r.channel_name, currentUserId)
     return `👤 ${(otherId && users[otherId]?.display_name) || t('search.dm')}`
   }
 
@@ -79,7 +86,7 @@ export default function SearchPanel({ onClose, onGoToMessage }: Props) {
           placeholder={t('search.placeholder')}
           onKeyDown={(e) => e.key === 'Escape' && onClose()}
         />
-        <button style={s.closeBtn} onClick={onClose}>✕</button>
+        <button style={s.closeBtn} onClick={onClose} aria-label={t('confirm.cancel')}>✕</button>
       </div>
 
       <div style={s.results}>
@@ -101,10 +108,7 @@ export default function SearchPanel({ onClose, onGoToMessage }: Props) {
             <div style={s.resultHeader}>
               <span style={s.senderName}>{r.sender?.display_name ?? t('search.unknown')}</span>
               <span style={s.channelBadge}>{getDMName(r)}</span>
-              <span style={s.timestamp}>
-                {new Date(r.created_at).toLocaleDateString('pl', { day: 'numeric', month: 'short' })}{' '}
-                {new Date(r.created_at).toLocaleTimeString('pl', { hour: '2-digit', minute: '2-digit' })}
-              </span>
+              <time style={s.timestamp} dateTime={r.created_at}>{formatMessageTime(r.created_at)}</time>
             </div>
             <div style={s.resultContent}>
               {highlight(r.content, query)}

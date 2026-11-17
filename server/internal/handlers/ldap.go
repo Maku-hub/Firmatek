@@ -2,12 +2,23 @@ package handlers
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"log"
+	"net/url"
 	"strings"
+	"time"
 
 	"firmatek/server/internal/config"
+
 	ldap "github.com/go-ldap/ldap/v3"
 )
+
+// errInvalidCredentials means the directory answered and rejected the login.
+// Any other error from AuthenticateLDAP is an infrastructure problem.
+var errInvalidCredentials = errors.New("invalid credentials")
+
+const ldapTimeout = 10 * time.Second
 
 type LDAPUserInfo struct {
 	Username    string
@@ -15,83 +26,94 @@ type LDAPUserInfo struct {
 	Email       string
 }
 
-// AuthenticateLDAP – verifies a user against AD/LDAP
-// Returns the user's data from AD or an error
+// AuthenticateLDAP checks the credentials against AD/LDAP and returns the
+// user's directory attributes.
 func AuthenticateLDAP(cfg *config.LDAPConfig, username, password string) (*LDAPUserInfo, error) {
-	if password == "" {
-		return nil, fmt.Errorf("empty password")
+	if username == "" || password == "" {
+		// An empty password would turn the user bind into an unauthenticated
+		// bind, which most directories accept.
+		return nil, errInvalidCredentials
 	}
 
-	// Connect to the LDAP server
-	var l *ldap.Conn
-	var err error
-
-	// TLS verification is on by default; set LDAP_TLS_SKIP_VERIFY=true only for a
-	// self-signed AD certificate.
-	tlsConf := &tls.Config{InsecureSkipVerify: cfg.TLSSkipVerify} //nolint:gosec // opt-in via config
-
-	if strings.HasPrefix(cfg.URL, "ldaps://") {
-		l, err = ldap.DialURL(cfg.URL, ldap.DialWithTLSConfig(tlsConf))
-	} else {
-		l, err = ldap.DialURL(cfg.URL)
-		if err == nil {
-			// Attempt STARTTLS for security. If it fails (server doesn't offer
-			// it, or demands a client certificate), the connection is left in a
-			// broken state, so reconnect with a fresh plain connection rather
-			// than failing all authentication.
-			if tlsErr := l.StartTLS(tlsConf); tlsErr != nil {
-				l.Close()
-				l, err = ldap.DialURL(cfg.URL)
-			}
-		}
-	}
+	l, err := dialLDAP(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to AD: %w", err)
+		return nil, fmt.Errorf("connect to directory: %w", err)
 	}
 	defer l.Close()
+	l.SetTimeout(ldapTimeout)
 
-	// Bind the service account (to look up the user's DN)
 	if cfg.BindUser != "" {
 		if err := l.Bind(cfg.BindUser, cfg.BindPassword); err != nil {
-			return nil, fmt.Errorf("service account bind error: %w", err)
+			return nil, fmt.Errorf("service account bind: %w", err)
 		}
 	}
 
-	// Find the user's DN
-	filter := fmt.Sprintf(cfg.UserFilter, ldap.EscapeFilter(username))
 	searchReq := ldap.NewSearchRequest(
 		cfg.BaseDN,
 		ldap.ScopeWholeSubtree,
 		ldap.NeverDerefAliases,
-		1, 30, false,
-		filter,
-		[]string{"dn", "displayName", "mail", "sAMAccountName"},
+		2, int(ldapTimeout.Seconds()), false,
+		fmt.Sprintf(cfg.UserFilter, ldap.EscapeFilter(username)),
+		[]string{"displayName", "mail", "sAMAccountName"},
 		nil,
 	)
-
 	sr, err := l.Search(searchReq)
-	if err != nil {
-		return nil, fmt.Errorf("user search error: %w", err)
+	if err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) {
+		return nil, fmt.Errorf("user search: %w", err)
 	}
-	if len(sr.Entries) == 0 {
-		return nil, fmt.Errorf("user not found in AD")
+	if sr == nil || len(sr.Entries) != 1 {
+		// Zero matches is a wrong login; more than one means the filter is
+		// ambiguous and we must not guess which account to bind as.
+		return nil, errInvalidCredentials
+	}
+	entry := sr.Entries[0]
+
+	if err := l.Bind(entry.DN, password); err != nil {
+		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+			return nil, errInvalidCredentials
+		}
+		return nil, fmt.Errorf("user bind: %w", err)
 	}
 
-	userDN := sr.Entries[0].DN
-
-	// Bind as the user – password verification
-	if err := l.Bind(userDN, password); err != nil {
-		return nil, fmt.Errorf("invalid password")
-	}
-
-	displayName := sr.Entries[0].GetAttributeValue("displayName")
+	displayName := strings.TrimSpace(entry.GetAttributeValue("displayName"))
 	if displayName == "" {
 		displayName = username
 	}
-
 	return &LDAPUserInfo{
 		Username:    strings.ToLower(username),
 		DisplayName: displayName,
-		Email:       sr.Entries[0].GetAttributeValue("mail"),
+		Email:       entry.GetAttributeValue("mail"),
 	}, nil
+}
+
+func dialLDAP(cfg *config.LDAPConfig) (*ldap.Conn, error) {
+	tlsConf := &tls.Config{InsecureSkipVerify: cfg.TLSSkipVerify} //nolint:gosec // opt-in for self-signed AD certificates
+	if host := ldapHost(cfg.URL); host != "" {
+		tlsConf.ServerName = host
+	}
+
+	if strings.HasPrefix(cfg.URL, "ldaps://") {
+		return ldap.DialURL(cfg.URL, ldap.DialWithTLSConfig(tlsConf))
+	}
+
+	l, err := ldap.DialURL(cfg.URL)
+	if err != nil {
+		return nil, err
+	}
+	// Prefer STARTTLS. A failed handshake leaves the connection unusable, so
+	// fall back to a fresh plain connection for servers that do not offer it.
+	if err := l.StartTLS(tlsConf); err != nil {
+		l.Close()
+		log.Printf("ldap: STARTTLS failed, continuing without encryption: %v", err)
+		return ldap.DialURL(cfg.URL)
+	}
+	return l, nil
+}
+
+func ldapHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }

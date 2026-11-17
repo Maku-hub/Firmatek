@@ -12,8 +12,9 @@
 {$FIRMATEK_DOMAIN:firmatek.local} {
 	tls internal
 	encode zstd gzip
+	# Files go peer-to-peer; the API never needs large bodies.
 	request_body {
-		max_size 100MB
+		max_size 2MB
 	}
-	reverse_proxy firmatek-server:8080
+	reverse_proxy firmatek-server:{$SERVER_PORT:8080}
 }

@@ -1,6 +1,8 @@
 import { useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '../../store'
-import { createChannel, createDirectChannel, getMessages, getChannelMembers, addChannelMember, leaveChannel } from '../../services/api'
+import { createChannel, createDirectChannel, getChannelMembers, addChannelMember, leaveChannel } from '../../services/api'
+import { openChannel } from '../../lib/channels'
 import ConfirmDialog from '../UI/ConfirmDialog'
 import { dmPartnerId } from '../../lib/dm'
 import { t } from '../../i18n'
@@ -27,7 +29,15 @@ interface Props {
 }
 
 export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName }: Props) {
-  const { channels, users, activeChannelId, unread, setActiveChannel, addChannel, setMessages, clearUnread, removeChannel } = useStore()
+  const { channels, users, activeChannelId, unread, setActiveChannel, addChannel, removeChannel } = useStore(useShallow((s) => ({
+    channels: s.channels,
+    users: s.users,
+    activeChannelId: s.activeChannelId,
+    unread: s.unread,
+    setActiveChannel: s.setActiveChannel,
+    addChannel: s.addChannel,
+    removeChannel: s.removeChannel,
+  })))
 
   const [showNewChannel, setShowNewChannel] = useState(false)
   const [newChannelName, setNewChannelName] = useState('')
@@ -41,32 +51,39 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
   const [confirmLogout, setConfirmLogout] = useState(false)
   const [confirmLeave, setConfirmLeave] = useState<string | null>(null) // channelId
 
-  const handleSelectChannel = async (channelId: string) => {
-    setActiveChannel(channelId)
-    clearUnread(channelId)
+  const [error, setError] = useState('')
+
+  const handleSelectChannel = (channelId: string) => {
     setShowMembersFor(null)
-    const msgs = await getMessages(channelId).catch(() => [])
-    setMessages(channelId, msgs)
+    openChannel(channelId)
   }
 
   const handleCreateChannel = async () => {
     if (!newChannelName.trim()) return
+    setError('')
     try {
       const res = await createChannel(newChannelName.trim(), selectedMembers)
-      addChannel({ id: res.channel_id, name: res.name, is_direct: false, created_by: currentUser.id, created_at: new Date().toISOString() })
-      handleSelectChannel(res.channel_id)
+      addChannel(res.channel)
+      handleSelectChannel(res.channel.id)
       setNewChannelName(''); setSelectedMembers([]); setShowNewChannel(false)
-    } catch {}
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const handleOpenDM = async (user: User) => {
+    setError('')
     try {
       const res = await createDirectChannel(user.id)
-      const existing = channels.find((c) => c.id === res.channel_id)
-      if (!existing) addChannel({ id: res.channel_id, name: `dm:${currentUser.id}:${user.id}`, is_direct: true, created_by: currentUser.id, created_at: new Date().toISOString() })
+      addChannel(res.channel ?? {
+        id: res.channel_id, name: `dm:${currentUser.id}:${user.id}`, is_direct: true,
+        created_by: currentUser.id, created_at: new Date().toISOString(),
+      })
       handleSelectChannel(res.channel_id)
       setTab('channels')
-    } catch {}
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const handleShowMembers = async (ch: Channel, e: React.MouseEvent) => {
@@ -80,21 +97,26 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
 
   const handleAddMember = async (userId: string) => {
     if (!showMembersFor) return
+    setError('')
     try {
       await addChannelMember(showMembersFor, userId)
-      const members = await getChannelMembers(showMembersFor)
-      setChannelMembers(members)
+      setChannelMembers(await getChannelMembers(showMembersFor))
       setShowAddMember(false)
-    } catch {}
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const handleLeaveConfirmed = async () => {
     if (!confirmLeave) return
+    setError('')
     try {
       await leaveChannel(confirmLeave)
       removeChannel(confirmLeave)
       if (activeChannelId === confirmLeave) setActiveChannel(null)
-    } catch {}
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
     setConfirmLeave(null)
     setShowMembersFor(null)
   }
@@ -126,6 +148,10 @@ export default function Sidebar({ currentUser, onLogout, onOpenSettings, appName
             </button>
           ))}
         </div>
+
+        {error && (
+          <div role="alert" style={s.error} onClick={() => setError('')}>{error}</div>
+        )}
 
         <div style={s.list}>
           {tab === 'channels' && <>
@@ -279,6 +305,7 @@ const s: Record<string, React.CSSProperties> = {
   tabs: { display: 'flex', padding: '8px 8px 0' },
   tabBtn: { flex: 1, padding: '6px 0', border: 'none', cursor: 'pointer', background: 'transparent', color: '#666', fontSize: 12, borderRadius: 6 },
   tabActive: { background: '#1e1e30', color: '#fff' },
+  error: { margin: '8px 8px 0', padding: '6px 10px', borderRadius: 6, background: '#3f1515', color: '#ff6b6b', fontSize: 12, cursor: 'pointer' },
   list: { flex: 1, overflowY: 'auto', padding: '8px 0' },
   section: { marginBottom: 8 },
   sectionHeader: { padding: '4px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: '#555', fontSize: 11, fontWeight: 700, letterSpacing: '0.08em' },

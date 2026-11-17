@@ -33,18 +33,27 @@ const (
 )
 
 type Message struct {
-	ID        string          `json:"id"`
-	ChannelID string          `json:"channel_id"`
-	SenderID  string          `json:"sender_id"`
-	Sender    *User           `json:"sender,omitempty"`
-	Type      MessageType     `json:"type"`
-	Content   string          `json:"content"`
-	Metadata  *MessageMeta    `json:"metadata,omitempty"`
-	CreatedAt time.Time       `json:"created_at"`
-	Delivered bool            `json:"delivered"`
+	ID        string       `json:"id"`
+	ChannelID string       `json:"channel_id"`
+	SenderID  string       `json:"sender_id"`
+	Sender    *User        `json:"sender,omitempty"`
+	Type      MessageType  `json:"type"`
+	Content   string       `json:"content"`
+	Metadata  *MessageMeta `json:"metadata,omitempty"`
+	CreatedAt time.Time    `json:"created_at"`
+	// ClientID is the sender's own ID for the message, echoed back so the
+	// sending app can match it with the copy it is waiting for.
+	ClientID string `json:"client_id,omitempty"`
 }
 
-// MessageMeta – extra data that depends on the message type
+// ErrorPayload describes a rejected frame. ClientID is set when the frame
+// was a chat message, so the sender knows which one failed.
+type ErrorPayload struct {
+	Message  string `json:"message"`
+	ClientID string `json:"client_id,omitempty"`
+}
+
+// MessageMeta holds extra data that depends on the message type.
 type MessageMeta struct {
 	// Code
 	Language string `json:"language,omitempty"`
@@ -57,27 +66,29 @@ type MessageMeta struct {
 	Height    int    `json:"height,omitempty"`
 
 	// File stored in the offline buffer
-	FileID      string `json:"file_id,omitempty"`
-	OrigName    string `json:"orig_name,omitempty"`
-	SHA256      string `json:"sha256,omitempty"`
-	ExpiresAt   string `json:"expires_at,omitempty"`
+	FileID    string `json:"file_id,omitempty"`
+	OrigName  string `json:"orig_name,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // --- WebSocket message protocol ---
 
-// WSMessageType – WebSocket message types
+// WSMessageType identifies a WebSocket event.
 type WSMessageType string
 
 const (
 	// Chat
-	WSTypeChatMessage  WSMessageType = "chat_message"
-	WSTypeMessageAck   WSMessageType = "message_ack"
+	WSTypeChatMessage WSMessageType = "chat_message"
+	// WSTypeMessageAck confirms to the sending connection that its message
+	// was stored. The payload is the stored Message, including client_id.
+	WSTypeMessageAck WSMessageType = "message_ack"
 
 	// Statuses
 	WSTypeUserStatus   WSMessageType = "user_status"
 	WSTypeTyping       WSMessageType = "typing"
-	WSTypeUserNew      WSMessageType = "user_new"        // new user in the system
-	WSTypeChannelAdded WSMessageType = "channel_added"   // user added to a channel
+	WSTypeUserNew      WSMessageType = "user_new"      // new user in the system
+	WSTypeChannelAdded WSMessageType = "channel_added" // user added to a channel
 
 	// WebRTC signaling
 	WSTypeRTCOffer     WSMessageType = "rtc_offer"
@@ -86,14 +97,14 @@ const (
 	WSTypeRTCDecline   WSMessageType = "rtc_decline"
 
 	// Heartbeat (application-level keepalive)
-	WSTypePing         WSMessageType = "ping"
-	WSTypePong         WSMessageType = "pong"
+	WSTypePing WSMessageType = "ping"
+	WSTypePong WSMessageType = "pong"
 
 	// Errors
-	WSTypeError        WSMessageType = "error"
+	WSTypeError WSMessageType = "error"
 )
 
-// WSMessage – the WebSocket frame format
+// WSMessage is the envelope of every WebSocket frame.
 type WSMessage struct {
 	Type      WSMessageType `json:"type"`
 	Payload   interface{}   `json:"payload"`

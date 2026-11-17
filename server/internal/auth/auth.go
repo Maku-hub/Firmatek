@@ -5,8 +5,15 @@ import (
 	"time"
 
 	"firmatek/server/internal/config"
+
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// TokenTTL is how long an issued token stays valid. Clients renew it through
+// /api/auth/refresh while they are running.
+const TokenTTL = 24 * time.Hour
+
+const issuer = "firmatek"
 
 type Claims struct {
 	UserID      string `json:"user_id"`
@@ -22,34 +29,34 @@ func Init(cfg *config.JWTConfig) {
 }
 
 func GenerateToken(userID, username, displayName string) (string, error) {
+	now := time.Now()
 	claims := Claims{
 		UserID:      userID,
 		Username:    username,
 		DisplayName: displayName,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			Issuer:    "firmatek",
+			ExpiresAt: jwt.NewNumericDate(now.Add(TokenTTL)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			Issuer:    issuer,
 		},
 	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(jwtSecret)
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(jwtSecret)
 }
 
 func ValidateToken(tokenStr string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
 		return jwtSecret, nil
-	})
+	},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(issuer),
+		jwt.WithExpirationRequired(),
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
+	if !ok || !token.Valid || claims.UserID == "" {
 		return nil, errors.New("invalid token")
 	}
 	return claims, nil

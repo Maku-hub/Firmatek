@@ -1,89 +1,134 @@
 import type { WSMessage, WSMessageType } from '../types'
-import { getWsURL } from './api'
+import { getMe, getToken, getWsURL } from './api'
 
 type Handler = (msg: WSMessage) => void
+type EventName = WSMessageType | '*' | 'connected' | 'disconnected'
 
-const HEARTBEAT_INTERVAL = 25_000 // send a ping this often while connected
-const HEARTBEAT_TIMEOUT = 60_000  // no pong within this window => treat as dead
+const HEARTBEAT_INTERVAL = 25_000
+const HEARTBEAT_TIMEOUT = 60_000 // no pong for this long => connection is dead
+const MAX_RECONNECT_DELAY = 30_000
 
 class WebSocketService {
   private ws: WebSocket | null = null
-  private handlers = new Map<WSMessageType | '*' | 'connected' | 'disconnected', Set<Handler>>()
+  private handlers = new Map<EventName, Set<Handler>>()
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectDelay = 1000
   private shouldConnect = false
-  // Buffer of messages that could not be sent because the socket was not open.
-  // Only durable messages (chat) are queued; transient signaling/typing is dropped.
-  private outbox: WSMessage[] = []
+  private everConnected = false
+  private failedAttempts = 0
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private lastPong = 0
 
   connect() {
     this.shouldConnect = true
-    this._connect()
+    this.open()
   }
 
-  private _connect() {
-    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return
+  disconnect() {
+    this.shouldConnect = false
+    this.everConnected = false
+    this.failedAttempts = 0
+    this.reconnectDelay = 1000
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
+    this.stopHeartbeat()
+    const ws = this.ws
+    this.ws = null
+    ws?.close()
+  }
 
-    const url = getWsURL()
-    if (!url.includes('token=') || url.endsWith('token=')) {
-      console.warn('[WS] No token – delaying connection')
-      this.scheduleReconnect()
-      return
-    }
+  /**
+   * Sends a frame if the socket is open and drops it otherwise. Chat messages
+   * go through services/outbox, which resends them after reconnecting.
+   */
+  send(msg: WSMessage) {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg))
+  }
 
-    console.log('[WS] Connecting to', url.replace(/token=.*/, 'token=***'))
-    this.ws = new WebSocket(url)
+  on(type: EventName, handler: Handler): () => void {
+    let set = this.handlers.get(type)
+    if (!set) { set = new Set(); this.handlers.set(type, set) }
+    set.add(handler)
+    return () => { set!.delete(handler) }
+  }
 
-    this.ws.onopen = () => {
-      console.log('[WS] Connected')
+  isConnected(): boolean { return this.ws?.readyState === WebSocket.OPEN }
+
+  private open() {
+    if (this.ws && this.ws.readyState <= WebSocket.OPEN) return
+    if (!getToken()) return
+
+    const ws = new WebSocket(getWsURL())
+    this.ws = ws
+    let opened = false
+
+    ws.onopen = () => {
+      opened = true
+      const reconnect = this.everConnected
+      this.everConnected = true
+      this.failedAttempts = 0
       this.reconnectDelay = 1000
       this.lastPong = Date.now()
       this.startHeartbeat()
-      this.flushOutbox()
-      this.dispatch({ type: 'connected' as WSMessageType, payload: null })
+      this.dispatch({ type: 'connected' as WSMessageType, payload: { reconnect } })
     }
 
-    this.ws.onmessage = (event) => {
-      const lines = (event.data as string).split('\n').filter(Boolean)
-      for (const line of lines) {
+    ws.onmessage = (event) => {
+      // The server may batch several JSON messages into one frame.
+      for (const line of String(event.data).split('\n')) {
+        if (!line) continue
+        let msg: WSMessage
         try {
-          const msg: WSMessage = JSON.parse(line)
-          if (msg.type === ('pong' as WSMessageType)) { this.lastPong = Date.now(); continue }
-          this.dispatch(msg)
+          msg = JSON.parse(line)
         } catch {
-          console.warn('[WS] Parse error:', line.slice(0, 100))
+          console.warn('[ws] unparsable frame:', line.slice(0, 100))
+          continue
         }
+        if (msg.type === 'pong') { this.lastPong = Date.now(); continue }
+        this.dispatch(msg)
       }
     }
 
-    this.ws.onclose = (e) => {
-      console.log('[WS] Disconnected, code:', e.code)
-      this.stopHeartbeat()
-      this.dispatch({ type: 'disconnected' as WSMessageType, payload: null })
+    ws.onclose = () => {
+      if (this.ws !== ws) return // replaced or closed on purpose
       this.ws = null
-      if (this.shouldConnect) this.scheduleReconnect()
+      this.stopHeartbeat()
+      if (opened) this.dispatch({ type: 'disconnected' as WSMessageType, payload: null })
+      if (!this.shouldConnect) return
+      if (!opened && ++this.failedAttempts === 2) {
+        // A handshake that keeps failing while the server is reachable usually
+        // means the token was rejected. The REST call reports a 401 to the app,
+        // which then signs out instead of retrying forever.
+        getMe().catch(() => {})
+      }
+      this.scheduleReconnect()
     }
 
-    this.ws.onerror = (e) => {
-      console.error('[WS] Connection error', e)
-      this.ws?.close()
-    }
+    ws.onerror = () => ws.close()
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer) return
+    // Jitter keeps a whole office from reconnecting in lockstep after a
+    // server restart.
+    const delay = this.reconnectDelay * (0.75 + Math.random() * 0.5)
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY)
+      if (this.shouldConnect) this.open()
+    }, delay)
   }
 
   private startHeartbeat() {
     this.stopHeartbeat()
     this.heartbeatTimer = setInterval(() => {
-      if (this.ws?.readyState !== WebSocket.OPEN) return
-      // If the peer has gone silent for too long the connection is half-open;
-      // force a close so the reconnect logic kicks in.
+      const ws = this.ws
+      if (ws?.readyState !== WebSocket.OPEN) return
       if (Date.now() - this.lastPong > HEARTBEAT_TIMEOUT) {
-        console.warn('[WS] Heartbeat timeout – forcing reconnect')
-        this.ws.close()
+        // Half-open connection: close it so the reconnect logic takes over.
+        ws.close()
         return
       }
-      try { this.ws.send(JSON.stringify({ type: 'ping' })) } catch { /* ignore */ }
+      ws.send(JSON.stringify({ type: 'ping' }))
     }, HEARTBEAT_INTERVAL)
   }
 
@@ -91,56 +136,10 @@ class WebSocketService {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null }
   }
 
-  private flushOutbox() {
-    if (!this.outbox.length || this.ws?.readyState !== WebSocket.OPEN) return
-    const pending = this.outbox
-    this.outbox = []
-    for (const msg of pending) this.ws.send(JSON.stringify(msg))
-  }
-
-  private scheduleReconnect() {
-    if (this.reconnectTimer) return
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30_000)
-      this._connect()
-    }, this.reconnectDelay)
-  }
-
-  disconnect() {
-    this.shouldConnect = false
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
-    this.stopHeartbeat()
-    this.outbox = []
-    this.ws?.close()
-    this.ws = null
-  }
-
-  send(msg: WSMessage) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg))
-    } else if (msg.type === 'chat_message') {
-      // Durable message – queue it and deliver once reconnected.
-      this.outbox.push(msg)
-      console.warn('[WS] Not connected – message queued for delivery')
-    } else {
-      // Transient (typing / RTC signaling) – safe to drop.
-      console.warn('[WS] Attempted to send without a connection')
-    }
-  }
-
-  on(type: WSMessageType | '*' | 'connected' | 'disconnected', handler: Handler): () => void {
-    if (!this.handlers.has(type)) this.handlers.set(type, new Set())
-    this.handlers.get(type)!.add(handler)
-    return () => this.handlers.get(type)?.delete(handler)
-  }
-
   private dispatch(msg: WSMessage) {
     this.handlers.get(msg.type)?.forEach((h) => h(msg))
     this.handlers.get('*')?.forEach((h) => h(msg))
   }
-
-  isConnected(): boolean { return this.ws?.readyState === WebSocket.OPEN }
 }
 
 export const wsService = new WebSocketService()

@@ -16,28 +16,29 @@ export default function ConfirmDialog({
   danger = false, onConfirm, onCancel,
 }: Props) {
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  const onCancelRef = useRef(onCancel)
+  onCancelRef.current = onCancel
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel()
-      // Enter confirms only for non-destructive dialogs, so an accidental Enter
-      // can't trigger a `danger` action (e.g. "Leave channel").
-      if (e.key === 'Enter' && !danger) onConfirm()
+    // Enter is handled by the focused button itself. For destructive actions
+    // focus starts on Cancel, so a stray Enter cannot confirm them.
+    ;(danger ? cancelRef : confirmRef).current?.focus()
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancelRef.current()
     }
-    window.addEventListener('keydown', handler)
-    // Focus the safe (cancel) side for danger dialogs, otherwise the confirm.
-    confirmRef.current?.focus()
-    return () => window.removeEventListener('keydown', handler)
-  }, [onConfirm, onCancel, danger])
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [danger])
 
   return (
     <div style={s.overlay} onClick={onCancel}>
       <div style={s.dialog} onClick={(e) => e.stopPropagation()}
-        role="dialog" aria-modal="true" aria-label={title}>
-        <div style={s.title}>{title}</div>
-        <div style={s.message}>{message}</div>
+        role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div id="confirm-title" style={s.title}>{title}</div>
+        <div id="confirm-message" style={s.message}>{message}</div>
         <div style={s.buttons}>
-          <button style={s.cancelBtn} onClick={onCancel}>{cancelLabel}</button>
+          <button ref={cancelRef} style={s.cancelBtn} onClick={onCancel}>{cancelLabel}</button>
           <button ref={confirmRef} style={{ ...s.confirmBtn, background: danger ? '#ef4444' : '#6366f1' }} onClick={onConfirm}>
             {confirmLabel}
           </button>
@@ -49,9 +50,9 @@ export default function ConfirmDialog({
 
 const s: Record<string, React.CSSProperties> = {
   overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 },
-  dialog: { background: '#1a1a24', borderRadius: 12, padding: '24px 28px', width: 360, boxShadow: '0 24px 60px rgba(0,0,0,0.6)', border: '1px solid #2a2a3e' },
+  dialog: { background: '#1a1a24', borderRadius: 12, padding: '24px 28px', width: 360, maxWidth: 'calc(100vw - 32px)', boxShadow: '0 24px 60px rgba(0,0,0,0.6)', border: '1px solid #2a2a3e' },
   title: { color: '#fff', fontWeight: 700, fontSize: 16, marginBottom: 10 },
-  message: { color: '#aaa', fontSize: 14, lineHeight: 1.6, marginBottom: 20, whiteSpace: 'pre-line' },
+  message: { color: '#aaa', fontSize: 14, lineHeight: 1.6, marginBottom: 20, whiteSpace: 'pre-line', overflowWrap: 'anywhere' },
   buttons: { display: 'flex', gap: 10, justifyContent: 'flex-end' },
   cancelBtn: { background: '#252535', border: '1px solid #333', borderRadius: 8, color: '#aaa', cursor: 'pointer', padding: '8px 18px', fontSize: 14 },
   confirmBtn: { border: 'none', borderRadius: 8, color: '#fff', cursor: 'pointer', padding: '8px 18px', fontSize: 14, fontWeight: 600 },

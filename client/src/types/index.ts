@@ -43,10 +43,25 @@ export interface Message {
   content: string
   metadata?: MessageMeta
   created_at: string
-  delivered: boolean
+  /** Set on messages sent by this user; matches the PendingMessage it confirms. */
+  client_id?: string
 }
 
-// ─── WebSocket protocol ───────────────────────────────────────────────────────
+/** A message this user sent that the server has not confirmed yet. */
+export interface PendingMessage {
+  client_id: string
+  channel_id: string
+  content: string
+  type: MessageType
+  metadata?: MessageMeta
+  created_at: string
+  status: 'sending' | 'failed'
+  /** The server refused it, so it is not resent automatically. */
+  rejected?: boolean
+  error?: string
+}
+
+// WebSocket protocol
 
 export type WSMessageType =
   | 'chat_message'

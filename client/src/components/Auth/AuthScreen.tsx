@@ -37,8 +37,11 @@ export default function AuthScreen({ onAuth }: Props) {
   const showRegister = authConfig?.registration_enabled ?? true
   const isLDAP = authConfig?.ldap_enabled ?? false
 
-  const handleSubmit = async () => {
+  const handleSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault()
+    if (loading) return
     setError('')
+    if (!username.trim() || !password) { setError(t('auth.fillFields')); return }
     if (mode === 'register') {
       if (!displayName.trim()) { setError(t('auth.enterFullName')); return }
       if (password !== password2) { setError(t('auth.passwordsMismatch')); return }
@@ -63,7 +66,7 @@ export default function AuthScreen({ onAuth }: Props) {
 
   return (
     <div style={s.bg}>
-      <div style={s.card}>
+      <form style={s.card} onSubmit={handleSubmit} noValidate>
 
         {/* Header – icon + name in one row */}
         <div style={s.header}>
@@ -88,7 +91,7 @@ export default function AuthScreen({ onAuth }: Props) {
           {showRegister && (
             <div style={s.tabs}>
               {(['login', 'register'] as const).map((m) => (
-                <button key={m} style={{ ...s.tab, ...(mode === m ? s.tabActive : {}) }}
+                <button key={m} type="button" style={{ ...s.tab, ...(mode === m ? s.tabActive : {}) }}
                   onClick={() => { setMode(m); setError('') }}>
                   {m === 'login' ? t('auth.signIn') : t('auth.register')}
                 </button>
@@ -112,25 +115,22 @@ export default function AuthScreen({ onAuth }: Props) {
           <input style={s.input} type="password" value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder="••••••••"
-            autoComplete={!isRegister ? 'current-password' : 'new-password'}
-            onKeyDown={(e) => e.key === 'Enter' && !isRegister && handleSubmit()} />
+            autoComplete={!isRegister ? 'current-password' : 'new-password'} />
 
           {isRegister && <>
             <label style={s.label}>{t('auth.repeatPassword')}</label>
             <input style={s.input} type="password" value={password2}
               onChange={(e) => setPassword2(e.target.value)}
-              placeholder="••••••••" autoComplete="new-password"
-              onKeyDown={(e) => e.key === 'Enter' && handleSubmit()} />
+              placeholder="••••••••" autoComplete="new-password" />
           </>}
         </div>
 
         {error && <div style={s.error}>{error}</div>}
 
-        <button style={{ ...s.btn, opacity: loading ? 0.6 : 1 }}
-          onClick={handleSubmit} disabled={loading}>
+        <button type="submit" style={{ ...s.btn, opacity: loading ? 0.6 : 1 }} disabled={loading}>
           {loading ? t('auth.connecting') : !isRegister ? t('auth.signIn') : t('auth.register')}
         </button>
-      </div>
+      </form>
     </div>
   )
 }

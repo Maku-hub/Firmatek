@@ -1,23 +1,38 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useStore } from './store'
 import { wsService } from './services/websocket'
 import { webrtcService } from './services/webrtc'
-import { getMe, getUsers, getChannels, getToken, logout, getAuthConfig } from './services/api'
+import { outbox } from './services/outbox'
+import {
+  getUsers, getChannels, getToken, logout, getAuthConfig, getMessages, getMe, refreshToken,
+  ApiError, PAGE_SIZE, SESSION_EXPIRED_EVENT,
+} from './services/api'
 import { loadSettings, applyScale } from './components/Settings/SettingsModal'
 import AuthScreen from './components/Auth/AuthScreen'
 import Sidebar from './components/Layout/Sidebar'
 import ChatWindow from './components/Chat/ChatWindow'
+import IncomingFiles from './components/Chat/IncomingFiles'
 import SettingsModal from './components/Settings/SettingsModal'
 import type { WSMessage, UserStatusPayload, Message, User, Channel } from './types'
-import type { IncomingOffer } from './services/webrtc'
 import { sendNotification, isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification'
 import { t } from './i18n'
 
-// Short notification sound (Web Audio API – no files required)
+const TOKEN_REFRESH_INTERVAL = 6 * 60 * 60_000
+const TYPING_TIMEOUT = 4000
+// Messages older than this when they arrive were queued while we were offline;
+// they still count as unread but do not ring or pop up one by one.
+const LIVE_MESSAGE_AGE = 2 * 60_000
+const SOUND_COOLDOWN = 1500
+const FINISHED_TRANSFER = ['done', 'error', 'declined', 'cancelled', 'timeout']
+
 let audioCtx: AudioContext | null = null
-function playNotifSound() {
+let lastSound = 0
+function playNotificationSound() {
+  const now = Date.now()
+  if (now - lastSound < SOUND_COOLDOWN) return
+  lastSound = now
   try {
-    if (!audioCtx) audioCtx = new AudioContext()
+    audioCtx ??= new AudioContext()
     const osc = audioCtx.createOscillator()
     const gain = audioCtx.createGain()
     osc.connect(gain)
@@ -28,151 +43,173 @@ function playNotifSound() {
     gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2)
     osc.start(audioCtx.currentTime)
     osc.stop(audioCtx.currentTime + 0.2)
-  } catch { /* no audio – ignore */ }
+  } catch { /* no audio device */ }
 }
 
-// OS system notification (Tauri plugin-notification)
+let notificationsAllowed: boolean | null = null
+async function ensureNotificationPermission(): Promise<boolean> {
+  if (notificationsAllowed !== null) return notificationsAllowed
+  try {
+    notificationsAllowed = (await isPermissionGranted()) || (await requestPermission()) === 'granted'
+  } catch {
+    notificationsAllowed = false // plugin missing, e.g. in a plain browser
+  }
+  return notificationsAllowed
+}
+
 async function showSystemNotification(message: Message) {
+  if (!(await ensureNotificationPermission())) return
+  const sender = message.sender?.display_name ?? useStore.getState().users[message.sender_id]?.display_name
+  const body = message.type === 'code_snippet'
+    ? t('app.codeSnippet')
+    : message.content.length > 120 ? message.content.slice(0, 120) + '…' : message.content
   try {
-    let ok = await isPermissionGranted()
-    if (!ok) {
-      const perm = await requestPermission()
-      ok = perm === 'granted'
-    }
-    if (!ok) return
-    const sender = useStore.getState().users[message.sender_id]
-    const title = sender?.display_name ?? t('app.newMessage')
-    const body = message.type === 'code_snippet'
-      ? t('app.codeSnippet')
-      : message.content.length > 120
-        ? message.content.slice(0, 120) + '…'
-        : message.content
-    sendNotification({ title, body })
-  } catch { /* plugin unavailable in dev – ignore */ }
-}
-
-async function requestNotifPermission() {
-  try {
-    const ok = await isPermissionGranted()
-    if (!ok) await requestPermission()
+    sendNotification({ title: sender ?? t('app.newMessage'), body })
   } catch { /* ignore */ }
 }
 
+/** Loads everything the main screen needs after signing in. */
+async function loadWorkspace() {
+  const [users, channels, cfg] = await Promise.all([getUsers(), getChannels(), getAuthConfig()])
+  const store = useStore.getState()
+  store.setUsers(users)
+  store.setChannels(channels)
+  return cfg.app_name
+}
+
 export default function App() {
-  const {
-    currentUser, setCurrentUser, wsConnected, setWsConnected,
-    setUsers, addUser, setChannels, addChannel, addMessage, updateUserStatus,
-    setTyping, incrementUnread,
-  } = useStore()
+  const currentUser = useStore((s) => s.currentUser)
+  const wsConnected = useStore((s) => s.wsConnected)
+  const setCurrentUser = useStore((s) => s.setCurrentUser)
 
   const [booting, setBooting] = useState(true)
   const [showSettings, setShowSettings] = useState(false)
   const [appName, setAppName] = useState('Firmatek')
 
-  // Apply the scale on startup – ONLY when logged in
+  // UI scaling applies to the main window only, not the login screen.
   useEffect(() => {
-    if (currentUser) applyScale(loadSettings().uiScale)
-    else applyScale(100) // reset on logout
+    applyScale(currentUser ? loadSettings().uiScale : 100)
   }, [currentUser])
 
-  useEffect(() => {
-    const token = getToken()
-    if (!token) { setBooting(false); return }
-    getMe()
-      .then((user) => {
-        setCurrentUser(user)
-        return Promise.all([getUsers(), getChannels(), getAuthConfig()])
-      })
-      .then(([users, channels, cfg]) => {
-        setUsers(users)
-        setChannels(channels)
-        setAppName(cfg.app_name)
-        requestNotifPermission()
-        setTimeout(() => wsService.connect(), 100)
-      })
-      .catch(() => logout())
-      .finally(() => setBooting(false))
+  const signOut = useCallback(() => {
+    const userId = useStore.getState().currentUser?.id
+    wsService.disconnect()
+    outbox.stop()
+    // Unsent messages must not stay on a shared computer after logout.
+    if (userId) outbox.clear(userId)
+    logout()
+    useStore.getState().reset()
   }, [])
 
-  const handleAuth = async (user: typeof currentUser) => {
+  const enterWorkspace = useCallback(async (user: User) => {
     setCurrentUser(user)
     try {
-      const [users, channels, cfg] = await Promise.all([getUsers(), getChannels(), getAuthConfig()])
-      setUsers(users)
-      setChannels(channels)
-      setAppName(cfg.app_name)
-      requestNotifPermission()
-      setTimeout(() => wsService.connect(), 100)
+      setAppName(await loadWorkspace())
+      ensureNotificationPermission()
+      wsService.connect()
     } catch {
-      // Failed to initialize after auth – drop back to the login screen.
-      logout()
-      setCurrentUser(null)
+      signOut()
     }
-  }
+  }, [setCurrentUser, signOut])
 
-  const handleLogout = () => {
-    wsService.disconnect()
-    logout()
-    setCurrentUser(null)
-  }
+  // Resume the previous session on start-up. Refreshing the token doubles as
+  // the "who am I" check and extends the session.
+  useEffect(() => {
+    if (!getToken()) { setBooting(false); return }
+    refreshToken()
+      // Servers older than the refresh endpoint answer 404; fall back to /me.
+      .catch((err) => (err instanceof ApiError && err.status === 404 ? getMe() : Promise.reject(err)))
+      .then(enterWorkspace)
+      .catch(() => logout())
+      .finally(() => setBooting(false))
+  }, [enterWorkspace])
+
+  useEffect(() => {
+    window.addEventListener(SESSION_EXPIRED_EVENT, signOut)
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, signOut)
+  }, [signOut])
 
   useEffect(() => {
     if (!currentUser) return
-    // Track auto-clear timers for typing indicators so they don't leak or fire
-    // after the effect is torn down.
-    const typingTimers = new Set<ReturnType<typeof setTimeout>>()
+    const timer = setInterval(() => {
+      refreshToken().then(setCurrentUser).catch((err) => {
+        if (err instanceof ApiError && err.status === 401) signOut()
+      })
+    }, TOKEN_REFRESH_INTERVAL)
+    return () => clearInterval(timer)
+  }, [currentUser?.id, setCurrentUser, signOut])
+
+  useEffect(() => {
+    if (!currentUser) return
+    const store = useStore.getState
+    const typingTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    outbox.start(currentUser.id)
+
     const unsubs = [
-      wsService.on('connected', () => setWsConnected(true)),
-      wsService.on('disconnected', () => setWsConnected(false)),
+      wsService.on('connected', async (msg) => {
+        store().setWsConnected(true)
+        if (!(msg.payload as { reconnect?: boolean })?.reconnect) return
+        // Presence and messages may have changed while we were away.
+        try {
+          await loadWorkspace()
+          const active = store().activeChannelId
+          if (active) store().mergeLatest(active, await getMessages(active), PAGE_SIZE)
+        } catch { /* next reconnect will try again */ }
+      }),
+      wsService.on('disconnected', () => store().setWsConnected(false)),
       wsService.on('chat_message', (msg: WSMessage) => {
         const message = msg.payload as Message
-        addMessage(message)
-        // Read the active channel live (via getState) so this subscription does
-        // not need to be torn down and recreated on every channel switch.
-        const active = useStore.getState().activeChannelId
-        if (message.channel_id !== active && message.sender_id !== currentUser?.id) {
-          incrementUnread(message.channel_id)
-          if (loadSettings().notifSound) {
-            playNotifSound()
-          }
-          showSystemNotification(message)
-        }
+        const s = store()
+        s.addMessage(message)
+        if (message.sender_id === currentUser.id) return
+
+        const inActiveChannel = message.channel_id === s.activeChannelId
+        const windowFocused = document.hasFocus()
+        if (!inActiveChannel) s.incrementUnread(message.channel_id)
+        if (inActiveChannel && windowFocused) return
+        if (Date.now() - Date.parse(message.created_at) > LIVE_MESSAGE_AGE) return
+
+        if (loadSettings().notifSound) playNotificationSound()
+        if (!windowFocused) showSystemNotification(message)
       }),
       wsService.on('user_status', (msg: WSMessage) => {
         const p = msg.payload as UserStatusPayload
-        updateUserStatus(p.user_id, p.online, p.last_seen)
+        store().updateUserStatus(p.user_id, p.online, p.last_seen)
       }),
       wsService.on('typing', (msg: WSMessage) => {
-        const p = msg.payload as { typing: boolean }
-        if (msg.sender_id && msg.channel_id) {
-          setTyping(msg.channel_id, msg.sender_id, p.typing)
-          const t = setTimeout(() => {
-            setTyping(msg.channel_id!, msg.sender_id!, false)
-            typingTimers.delete(t)
-          }, 3000)
-          typingTimers.add(t)
+        const { sender_id: userId, channel_id: channelId } = msg
+        if (!userId || !channelId) return
+        const typing = (msg.payload as { typing?: boolean })?.typing === true
+        const key = `${channelId}:${userId}`
+        clearTimeout(typingTimers.get(key))
+        typingTimers.delete(key)
+        store().setTyping(channelId, userId, typing)
+        if (typing) {
+          // Fallback in case the "stopped typing" event never arrives.
+          typingTimers.set(key, setTimeout(() => {
+            typingTimers.delete(key)
+            store().setTyping(channelId, userId, false)
+          }, TYPING_TIMEOUT))
         }
       }),
-      wsService.on('user_new', (msg: WSMessage) => {
-        const user = msg.payload as User
-        addUser(user)
-      }),
-      wsService.on('channel_added', (msg: WSMessage) => {
-        const channel = msg.payload as Channel
-        addChannel(channel)
-      }),
+      wsService.on('user_new', (msg: WSMessage) => store().addUser(msg.payload as User)),
+      wsService.on('channel_added', (msg: WSMessage) => store().addChannel(msg.payload as Channel)),
     ]
 
-    webrtcService.setIncomingCallback((offer: IncomingOffer) => {
-      const senderName = useStore.getState().users[offer.fromUserID]?.display_name ?? offer.fromUserID
-      window.dispatchEvent(new CustomEvent('rtc-incoming', { detail: { offer, senderName } }))
+    webrtcService.setProgressCallback((state) => {
+      const { setTransfer, removeTransfer } = store()
+      setTransfer(state.id, {
+        filename: state.filename, progress: state.progress, status: state.status, direction: state.direction,
+      })
+      if (FINISHED_TRANSFER.includes(state.status)) setTimeout(() => removeTransfer(state.id), 4000)
     })
 
     return () => {
       unsubs.forEach((u) => u())
-      typingTimers.forEach((t) => clearTimeout(t))
+      typingTimers.forEach((timer) => clearTimeout(timer))
+      outbox.stop()
     }
-  }, [currentUser])
+  }, [currentUser?.id])
 
   if (booting) {
     return (
@@ -182,18 +219,19 @@ export default function App() {
     )
   }
 
-  if (!currentUser) return <AuthScreen onAuth={(u) => handleAuth(u)} />
+  if (!currentUser) return <AuthScreen onAuth={enterWorkspace} />
 
   return (
-    // id="app-wrapper" – only this element is scaled by the settings
+    // Only #app-wrapper is scaled by the UI scale setting.
     <div id="app-wrapper" style={{ display: 'flex', width: '100%', height: '100%', overflow: 'hidden', background: '#0f0f13' }}>
       {!wsConnected && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 1000, background: '#3f1515', color: '#ff6b6b', textAlign: 'center', padding: '6px 16px', fontSize: 13 }}>
+        <div role="status" style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 1000, background: '#3f1515', color: '#ff6b6b', textAlign: 'center', padding: '6px 16px', fontSize: 13 }}>
           {t('app.noConnection')}
         </div>
       )}
-      <Sidebar currentUser={currentUser} onLogout={handleLogout} onOpenSettings={() => setShowSettings(true)} appName={appName} />
+      <Sidebar currentUser={currentUser} onLogout={signOut} onOpenSettings={() => setShowSettings(true)} appName={appName} />
       <ChatWindow />
+      <IncomingFiles />
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
     </div>
   )

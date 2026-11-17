@@ -13,10 +13,10 @@ import (
 // RateLimiter is a simple in-memory token-bucket limiter keyed by an arbitrary
 // string (e.g. client IP or user ID). Safe for concurrent use.
 type RateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*bucket
-	rate     float64 // tokens added per second
-	burst    float64 // max tokens
+	mu        sync.Mutex
+	buckets   map[string]*bucket
+	rate      float64 // tokens added per second
+	burst     float64 // max tokens
 	lastSweep time.Time
 }
 
@@ -83,7 +83,7 @@ func RateLimit(l *RateLimiter) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !l.Allow(c.ClientIP()) {
 			c.Header("Retry-After", "60")
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many requests – slow down"})
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many requests, slow down"})
 			c.Abort()
 			return
 		}

@@ -1,14 +1,13 @@
 package hub
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
+	"log"
 	"sync"
 	"time"
 
-	"firmatek/server/internal/cache"
 	"firmatek/server/internal/models"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -16,10 +15,11 @@ const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512 * 1024 // 512KB – large messages are files, not inline content
+	maxMessageSize = 512 * 1024 // files go peer-to-peer, so frames stay small
+	sendBuffer     = 256
 )
 
-// Client – represents a single WebSocket connection
+// Client is a single WebSocket connection. One user can have several.
 type Client struct {
 	UserID      string
 	Username    string
@@ -29,17 +29,33 @@ type Client struct {
 	conn *websocket.Conn
 	send chan []byte
 
-	// Guards send/close so the channel is never written to or closed twice.
+	// mu guards send against concurrent close, so it is never written to or
+	// closed after it has been closed.
 	mu     sync.Mutex
 	closed bool
 
-	// Dependencies needed to handle messages
-	cache         *cache.Cache
-	messageRouter func(client *Client, msg *models.WSMessage)
+	route func(client *Client, msg *models.WSMessage)
 }
 
-// trySend performs a non-blocking send on the client's channel.
-// Returns false if the client is already closed or its buffer is full.
+func NewClient(
+	hub *Hub,
+	conn *websocket.Conn,
+	userID, username, displayName string,
+	route func(client *Client, msg *models.WSMessage),
+) *Client {
+	return &Client{
+		UserID:      userID,
+		Username:    username,
+		DisplayName: displayName,
+		hub:         hub,
+		conn:        conn,
+		send:        make(chan []byte, sendBuffer),
+		route:       route,
+	}
+}
+
+// trySend queues data without blocking. It returns false if the connection
+// is closed or its buffer is full.
 func (c *Client) trySend(data []byte) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -54,8 +70,7 @@ func (c *Client) trySend(data []byte) bool {
 	}
 }
 
-// closeSend closes the send channel exactly once. Safe to call from multiple
-// goroutines and multiple times.
+// closeSend closes the send channel exactly once.
 func (c *Client) closeSend() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -66,26 +81,28 @@ func (c *Client) closeSend() {
 	close(c.send)
 }
 
-func NewClient(
-	hub *Hub,
-	conn *websocket.Conn,
-	userID, username, displayName string,
-	c *cache.Cache,
-	router func(client *Client, msg *models.WSMessage),
-) *Client {
-	return &Client{
-		UserID:        userID,
-		Username:      username,
-		DisplayName:   displayName,
-		hub:           hub,
-		conn:          conn,
-		send:          make(chan []byte, 256),
-		cache:         c,
-		messageRouter: router,
+// Send queues a message for this connection only.
+func (c *Client) Send(msg *models.WSMessage) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
 	}
+	c.trySend(data)
 }
 
-// ReadPump – receives messages from the client
+// SendError reports a problem with a frame the client sent.
+func (c *Client) SendError(text string) {
+	c.SendMessageError("", text)
+}
+
+// SendMessageError reports why a chat message with the given client ID was
+// not accepted.
+func (c *Client) SendMessageError(clientID, text string) {
+	c.Send(&models.WSMessage{Type: models.WSTypeError, Payload: models.ErrorPayload{Message: text, ClientID: clientID}})
+}
+
+// ReadPump reads frames from the connection until it fails, then unregisters
+// the client.
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -95,32 +112,29 @@ func (c *Client) ReadPump() {
 	c.conn.SetReadLimit(maxMessageSize)
 	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
-		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		_ = c.cache.RefreshOnlineTTL(context.Background(), c.UserID)
-		return nil
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
 	for {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				fmt.Printf("[WS] Unexpected close (%s): %v\n", c.UserID, err)
+				log.Printf("ws: unexpected close for %s: %v", c.UserID, err)
 			}
-			break
+			return
 		}
 
 		var msg models.WSMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
-			c.sendError("Invalid message format")
+			c.SendError("invalid message format")
 			continue
 		}
 		msg.SenderID = c.UserID
-
-		c.messageRouter(c, &msg)
+		c.route(c, &msg)
 	}
 }
 
-// WritePump – sends messages to the client
+// WritePump writes queued messages and keepalive pings to the connection.
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -142,11 +156,15 @@ func (c *Client) WritePump() {
 			}
 			_, _ = w.Write(message)
 
-			// Flush the buffer in a single write
-			n := len(c.send)
-			for i := 0; i < n; i++ {
+			// Coalesce whatever else is already queued into the same frame;
+			// the client splits on newlines.
+			for n := len(c.send); n > 0; n-- {
+				next, ok := <-c.send
+				if !ok {
+					break
+				}
 				_, _ = w.Write([]byte{'\n'})
-				_, _ = w.Write(<-c.send)
+				_, _ = w.Write(next)
 			}
 			if err := w.Close(); err != nil {
 				return
@@ -158,17 +176,5 @@ func (c *Client) WritePump() {
 				return
 			}
 		}
-	}
-}
-
-func (c *Client) sendError(msg string) {
-	errMsg := &models.WSMessage{
-		Type:    models.WSTypeError,
-		Payload: map[string]string{"message": msg},
-	}
-	data, _ := json.Marshal(errMsg)
-	select {
-	case c.send <- data:
-	default:
 	}
 }

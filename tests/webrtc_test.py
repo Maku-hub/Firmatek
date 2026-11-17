@@ -94,7 +94,9 @@ async def run():
                 channel.send(FILE[i:i + CHUNK])
                 while channel.bufferedAmount > CHUNK * 8:
                     await asyncio.sleep(0.01)
-            channel.send(json.dumps({"type": "eof"}))
+            # Current clients send the checksum with "eof" (computed while
+            # streaming) instead of in the offer.
+            channel.send(json.dumps({"type": "eof", "sha256": SHA}))
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)  # aiortc gathers ICE into the SDP
@@ -102,7 +104,7 @@ async def run():
             "type": "rtc_offer", "target_id": b_id,
             "payload": {"sdp": {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
                         "transferID": transfer_id, "filename": "blob.bin",
-                        "fileSize": len(FILE), "sha256": SHA},
+                        "fileSize": len(FILE)},
         }))
         async for msg in ws_sender(a_ws):
             if msg.get("type") == "rtc_answer":

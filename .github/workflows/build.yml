@@ -11,9 +11,11 @@ on:
         required: false
         default: ""
 
-# Pin the Rust toolchain so installer builds are reproducible.
+# Pin the Rust toolchain so installer builds are reproducible. Keep it in sync
+# with `rust-version` in client/src-tauri/Cargo.toml; the rust-check job
+# fails if Cargo.lock starts needing a newer compiler.
 env:
-  RUST_TOOLCHAIN: "1.83.0"
+  RUST_TOOLCHAIN: "1.89.0"
 
 jobs:
   # Fast quality gate — runs on every push and PR.
@@ -26,8 +28,10 @@ jobs:
       - name: Go tests (race) + vet
         working-directory: server
         run: |
-          go test -race ./...
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "Run gofmt on:"; echo "$unformatted"; exit 1; fi
           go vet ./...
+          go test -race ./...
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
@@ -39,12 +43,34 @@ jobs:
           npm ci
           npm run build
 
+  # Compiles the desktop app with the pinned toolchain on every push, so a
+  # dependency update that raises the minimum Rust version is caught here and
+  # not when someone tries to build installers.
+  rust-check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "${{ env.RUST_TOOLCHAIN }}" }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: client/src-tauri }
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+      - name: cargo check
+        working-directory: client/src-tauri
+        run: |
+          # tauri::generate_context! needs the built frontend directory to exist
+          mkdir -p ../dist
+          cargo check --locked
+
   # Installers are built on demand only (tags/releases are created manually).
   # Trigger from the Actions tab → "Run workflow", then download the artifacts
   # and attach them to a GitHub Release by hand.
   build-windows:
     if: github.event_name == 'workflow_dispatch'
-    needs: test
+    needs: [test, rust-check]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -71,7 +97,7 @@ jobs:
 
   build-linux:
     if: github.event_name == 'workflow_dispatch'
-    needs: test
+    needs: [test, rust-check]
     runs-on: ubuntu-22.04
     strategy:
       matrix:

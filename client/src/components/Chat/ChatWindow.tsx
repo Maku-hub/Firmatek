@@ -1,27 +1,45 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '../../store'
 import { wsService } from '../../services/websocket'
 import { webrtcService } from '../../services/webrtc'
+import { outbox } from '../../services/outbox'
 import { loadSettings } from '../Settings/SettingsModal'
-import { getMessages } from '../../services/api'
-import type { Message } from '../../types'
-import type { IncomingOffer } from '../../services/webrtc'
+import { getMessages, PAGE_SIZE } from '../../services/api'
+import type { Message, PendingMessage, User } from '../../types'
 import { dmPartnerId } from '../../lib/dm'
+import { openChannel } from '../../lib/channels'
+import { formatMessageTime } from '../../lib/format'
 import { t } from '../../i18n'
 import CodeBlock from './CodeBlock'
 import FileTransferBar from './FileTransferBar'
 import EmojiPicker from './EmojiPicker'
 import SearchPanel from './SearchPanel'
-import ConfirmDialog from '../UI/ConfirmDialog'
+
+const EMPTY: Message[] = []
+const EMPTY_IDS: string[] = []
+// Send "typing" at most this often while the user keeps typing, and "stopped"
+// after this much silence.
+const TYPING_THROTTLE = 2500
+const TYPING_IDLE = 2000
 
 export default function ChatWindow() {
-  const { currentUser, activeChannelId, channels, messages, users, typing, transfers } = useStore()
-  const setTransfer = useStore((s) => s.setTransfer)
+  const { currentUser, activeChannelId, channel, channelMessages, hasMore, users, typingIds, transfers, allPending } = useStore(
+    useShallow((s) => ({
+      currentUser: s.currentUser,
+      activeChannelId: s.activeChannelId,
+      channel: s.channels.find((c) => c.id === s.activeChannelId),
+      channelMessages: (s.activeChannelId && s.messages[s.activeChannelId]) || EMPTY,
+      hasMore: s.activeChannelId ? s.hasMore[s.activeChannelId] ?? false : false,
+      users: s.users,
+      typingIds: (s.activeChannelId && s.typing[s.activeChannelId]) || EMPTY_IDS,
+      transfers: s.transfers,
+      allPending: s.pending,
+    })),
+  )
+  const pending = allPending.filter((p) => p.channel_id === activeChannelId)
   const removeTransfer = useStore((s) => s.removeTransfer)
-  const setMessages = useStore((s) => s.setMessages)
   const prependMessages = useStore((s) => s.prependMessages)
-  const setActiveChannel = useStore((s) => s.setActiveChannel)
-  const clearUnread = useStore((s) => s.clearUnread)
 
   const [text, setText] = useState('')
   const [codeMode, setCodeMode] = useState(false)
@@ -30,186 +48,139 @@ export default function ChatWindow() {
   const [showEmoji, setShowEmoji] = useState(false)
   const [showSearch, setShowSearch] = useState(false)
   const [scrollToMsgId, setScrollToMsgId] = useState<string | null>(null)
-
-  const [incomingOffer, setIncomingOffer] = useState<{ offer: IncomingOffer; senderName: string } | null>(null)
   const [loadingOlder, setLoadingOlder] = useState(false)
-  const [fullyLoaded, setFullyLoaded] = useState<Set<string>>(new Set())
+  const [notice, setNotice] = useState('')
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const typingSentAt = useRef(0)
+  const typingIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const channel = channels.find((c) => c.id === activeChannelId)
-  const channelMessages = activeChannelId ? (messages[activeChannelId] ?? []) : []
   const isDM = channel?.is_direct ?? false
-  const activeTransfers = Object.entries(transfers)
+  const recipientId = isDM && channel && currentUser ? dmPartnerId(channel.name, currentUser.id) : null
+  const recipientOnline = recipientId ? users[recipientId]?.online ?? false : false
+  const settings = loadSettings()
 
-  // Listen for incoming WebRTC files
+  // Stick to the bottom when a new message arrives or the channel changes, but
+  // not when older history is prepended (that changes the first id, not the last).
+  const lastMsgId = pending.length
+    ? pending[pending.length - 1].client_id
+    : channelMessages[channelMessages.length - 1]?.id
   useEffect(() => {
-    const handler = (e: Event) => {
-      const { offer, senderName } = (e as CustomEvent).detail
-      setIncomingOffer({ offer, senderName })
-    }
-    window.addEventListener('rtc-incoming', handler)
-    return () => window.removeEventListener('rtc-incoming', handler)
-  }, [])
-
-  // Auto-scroll to the bottom on a new (newest) message or channel switch — but
-  // NOT when older messages are prepended (which changes length but not the last id).
-  const lastMsgId = channelMessages[channelMessages.length - 1]?.id
-  useEffect(() => {
-    if (!scrollToMsgId) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
+    if (!scrollToMsgId) bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [lastMsgId, activeChannelId, scrollToMsgId])
 
-  const loadOlder = async () => {
-    if (!activeChannelId || loadingOlder) return
-    const oldest = channelMessages[0]
-    if (!oldest) return
-    setLoadingOlder(true)
-    const older = await getMessages(activeChannelId, oldest.created_at, 50).catch(() => [] as Message[])
-    if (older.length < 50) {
-      setFullyLoaded((prev) => new Set(prev).add(activeChannelId))
-    }
-    if (older.length > 0) {
-      const el = messagesRef.current
-      const prevHeight = el?.scrollHeight ?? 0
-      prependMessages(activeChannelId, older)
-      // Preserve the viewport position after older messages are prepended.
-      requestAnimationFrame(() => {
-        if (el) el.scrollTop = el.scrollHeight - prevHeight
-      })
-    }
-    setLoadingOlder(false)
-  }
+  // Leaving a channel (or the window) must clear our typing indicator there.
+  useEffect(() => () => stopTyping(activeChannelId), [activeChannelId])
 
-  // Scroll to a specific message from the search panel
+  useEffect(() => { setNotice('') }, [activeChannelId])
+
+  // Jump to a message picked in the search panel once it has rendered.
   useEffect(() => {
     if (!scrollToMsgId) return
-    let attempts = 0
-    const maxAttempts = 30 // ~2 seconds
-    let rafId = 0
-
-    const tryScroll = () => {
-      const el = messagesRef.current?.querySelector(`[data-msg-id="${scrollToMsgId}"]`) as HTMLElement | null
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-        el.style.outline = '2px solid #6366f1'
-        el.style.outlineOffset = '4px'
-        el.style.borderRadius = '12px'
-        setTimeout(() => { el.style.outline = ''; el.style.outlineOffset = '' }, 2500)
-        setScrollToMsgId(null)
-      } else if (attempts < maxAttempts) {
-        attempts++
-        rafId = requestAnimationFrame(() => setTimeout(tryScroll, 60))
-      } else {
-        setScrollToMsgId(null) // element not found after many attempts
-      }
+    const el = messagesRef.current?.querySelector<HTMLElement>(`[data-msg-id="${CSS.escape(scrollToMsgId)}"]`)
+    if (!el) {
+      // Older than the loaded history; give up rather than block auto-scroll.
+      setScrollToMsgId(null)
+      return
     }
-    tryScroll()
-    return () => cancelAnimationFrame(rafId)
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.style.outline = '2px solid #6366f1'
+    el.style.outlineOffset = '4px'
+    const timer = setTimeout(() => { el.style.outline = ''; el.style.outlineOffset = '' }, 2500)
+    setScrollToMsgId(null)
+    return () => clearTimeout(timer)
   }, [scrollToMsgId, channelMessages])
 
-  // Ctrl+F
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); setShowSearch((v) => !v) }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); setShowSearch((v) => !v) }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  const sendTyping = useCallback(() => {
+  const loadOlder = async () => {
+    if (!activeChannelId || loadingOlder || !channelMessages.length) return
+    const channelId = activeChannelId
+    setLoadingOlder(true)
+    try {
+      const older = await getMessages(channelId, channelMessages[0], PAGE_SIZE)
+      const el = messagesRef.current
+      const prevHeight = el?.scrollHeight ?? 0
+      prependMessages(channelId, older, PAGE_SIZE)
+      // Keep the viewport where it was instead of jumping to the new top.
+      requestAnimationFrame(() => { if (el) el.scrollTop = el.scrollHeight - prevHeight })
+    } catch (err) {
+      console.error('[chat] cannot load older messages:', err)
+    } finally {
+      setLoadingOlder(false)
+    }
+  }
+
+  const onTextChange = (value: string) => {
+    setText(value)
     if (!activeChannelId) return
-    wsService.send({ type: 'typing', channel_id: activeChannelId, payload: { typing: true } })
-    if (typingTimer.current) clearTimeout(typingTimer.current)
-    typingTimer.current = setTimeout(() => {
-      wsService.send({ type: 'typing', channel_id: activeChannelId, payload: { typing: false } })
-    }, 2000)
-  }, [activeChannelId])
+    const now = Date.now()
+    if (now - typingSentAt.current > TYPING_THROTTLE) {
+      typingSentAt.current = now
+      wsService.send({ type: 'typing', channel_id: activeChannelId, payload: { typing: true } })
+    }
+    if (typingIdleTimer.current) clearTimeout(typingIdleTimer.current)
+    const channelId = activeChannelId
+    typingIdleTimer.current = setTimeout(() => stopTyping(channelId), TYPING_IDLE)
+  }
+
+  function stopTyping(channelId: string | null) {
+    if (typingIdleTimer.current) { clearTimeout(typingIdleTimer.current); typingIdleTimer.current = null }
+    if (!channelId || !typingSentAt.current) return
+    typingSentAt.current = 0
+    wsService.send({ type: 'typing', channel_id: channelId, payload: { typing: false } })
+  }
 
   const sendMessage = () => {
     if (!text.trim() || !activeChannelId) return
-    wsService.send({
-      type: 'chat_message', channel_id: activeChannelId,
-      payload: {
-        channel_id: activeChannelId, content: text,
-        type: codeMode ? 'code_snippet' : 'text',
-        ...(codeMode && { metadata: { language: codeLang } }),
-      },
-    })
+    stopTyping(activeChannelId)
+    outbox.send(activeChannelId, text, codeMode ? 'code_snippet' : 'text', codeMode ? { language: codeLang } : undefined)
     setText(''); setCodeMode(false); inputRef.current?.focus()
   }
 
-  const settings = loadSettings()
-
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (codeMode) {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMessage() }
-    } else {
-      if (settings.sendOnEnter) {
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
-      } else {
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMessage() }
-      }
+    if (e.key !== 'Enter' || e.nativeEvent.isComposing) return
+    const sendOnPlainEnter = settings.sendOnEnter && !codeMode
+    if (sendOnPlainEnter ? !e.shiftKey : e.ctrlKey || e.metaKey) {
+      e.preventDefault()
+      sendMessage()
     }
   }
 
   const insertEmoji = (emoji: string) => {
-    setText((prev) => prev + emoji); setShowEmoji(false); inputRef.current?.focus()
-  }
-
-  // ─── All files → P2P ────────────────────────────────────────────────────────
-  const setupProgressCallback = () => {
-    webrtcService.setProgressCallback((state) => {
-      setTransfer(state.id, { filename: state.filename, progress: state.progress, status: state.status, direction: state.direction })
-      if (['done', 'error', 'declined', 'cancelled', 'timeout'].includes(state.status)) {
-        setTimeout(() => removeTransfer(state.id), 4000)
-      }
+    const el = inputRef.current
+    const start = el?.selectionStart ?? text.length
+    const end = el?.selectionEnd ?? text.length
+    setText(text.slice(0, start) + emoji + text.slice(end))
+    setShowEmoji(false)
+    requestAnimationFrame(() => {
+      el?.focus()
+      el?.setSelectionRange(start + emoji.length, start + emoji.length)
     })
   }
 
-  const handleFile = async (file: File) => {
+  // Files always go peer-to-peer and never through the server.
+  const handleFile = (file: File) => {
     if (!activeChannelId || !currentUser) return
-
-    if (!isDM) {
-      alert(t('chat.filesOnlyDM'))
-      return
-    }
-
-    const recipientID = getDMRecipient()
-    if (!recipientID) return
-
-    const recipientOnline = useStore.getState().users[recipientID]?.online
-    if (!recipientOnline) {
-      wsService.send({
-        type: 'chat_message', channel_id: activeChannelId,
-        payload: {
-          channel_id: activeChannelId,
-          content: t('chat.cannotSendOffline', { name: file.name }),
-          type: 'text',
-        },
-      })
-      return
-    }
-
-    setupProgressCallback()
-    const sha256 = await computeSHA256(file)
-    await webrtcService.sendFile(file, recipientID, sha256, currentUser.id)
-  }
-
-  const getDMRecipient = (): string | null => {
-    if (!channel?.is_direct || !currentUser) return null
-    return dmPartnerId(channel.name, currentUser.id)
+    if (!isDM || !recipientId) { setNotice(t('chat.filesOnlyDM')); return }
+    if (!recipientOnline) { setNotice(t('chat.cannotSendOffline', { name: file.name })); return }
+    setNotice('')
+    webrtcService.sendFile(file, recipientId)
   }
 
   const handlePaste = (e: React.ClipboardEvent) => {
     for (const item of e.clipboardData.items) {
-      if (item.type.startsWith('image/')) {
+      if (item.kind === 'file') {
         const file = item.getAsFile()
-        if (file) { handleFile(file); e.preventDefault(); return }
+        if (file) { e.preventDefault(); handleFile(file); return }
       }
     }
   }
@@ -218,27 +189,6 @@ export default function ChatWindow() {
     e.preventDefault(); setDragging(false)
     const file = e.dataTransfer.files[0]
     if (file) handleFile(file)
-  }
-
-  // Accepting an incoming WebRTC file
-  const handleAcceptFile = async () => {
-    if (!incomingOffer) return
-    const { offer } = incomingOffer
-    setIncomingOffer(null)
-
-    setupProgressCallback()
-
-    try {
-      const blob = await webrtcService.acceptIncoming(offer)
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url; a.download = offer.filename; a.click()
-      // Defer revocation so the WebView has time to start reading the blob;
-      // revoking synchronously right after click() can abort the download.
-      setTimeout(() => URL.revokeObjectURL(url), 10_000)
-    } catch (err) {
-      console.error('[P2P] Receive error:', err)
-    }
   }
 
   if (!activeChannelId || !channel) {
@@ -250,34 +200,29 @@ export default function ChatWindow() {
     )
   }
 
-  const typingUsers = [...(typing[activeChannelId] ?? [])]
+  const typingUsers = typingIds
     .filter((id) => id !== currentUser?.id)
     .map((id) => users[id]?.display_name ?? t('chat.someone'))
 
-  let channelTitle = channel.name
-  if (channel.is_direct) {
-    const otherId = dmPartnerId(channel.name, currentUser?.id ?? '')
-    channelTitle = (otherId && users[otherId]?.display_name) || t('chat.directMessage')
-  }
-
-  const recipientOnline = isDM ? (users[getDMRecipient() ?? '']?.online ?? false) : null
+  const channelTitle = channel.is_direct
+    ? (recipientId && users[recipientId]?.display_name) || t('chat.directMessage')
+    : channel.name
 
   const placeholderText = codeMode
     ? t('chat.placeholderCode')
-    : settings.sendOnEnter
-      ? t('chat.placeholderEnter')
-      : t('chat.placeholderCtrlEnter')
+    : settings.sendOnEnter ? t('chat.placeholderEnter') : t('chat.placeholderCtrlEnter')
+
+  const activeTransfers = Object.entries(transfers)
 
   return (
     <div style={{ ...s.chat, ...(dragging ? s.chatDragging : {}) }}
-      onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
-      onDragLeave={() => setDragging(false)}
+      onDragOver={(e) => { e.preventDefault(); if (!dragging) setDragging(true) }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false) }}
       onDrop={handleDrop}>
 
-      {/* Header */}
       <div style={s.header}>
         <span style={s.channelName}>{channel.is_direct ? '👤' : '#'} {channelTitle}</span>
-        {isDM && recipientOnline !== null && (
+        {isDM && (
           <span style={s.statusBadge}>
             <span style={{ ...s.statusDotSmall, background: recipientOnline ? '#22c55e' : '#555' }} />
             <span style={{ color: recipientOnline ? '#22c55e' : '#666', fontSize: 12 }}>
@@ -285,37 +230,38 @@ export default function ChatWindow() {
             </span>
           </span>
         )}
-        <button style={s.searchBtn} onClick={() => setShowSearch(!showSearch)} title={t('chat.searchTitle')}>🔍</button>
+        <button style={s.searchBtn} onClick={() => setShowSearch(!showSearch)} title={t('chat.searchTitle')} aria-label={t('chat.searchTitle')}>🔍</button>
       </div>
 
-      {/* Transfer bars */}
       {activeTransfers.length > 0 && (
-        <div style={{ padding: '6px 20px', background: '#13131c', borderBottom: '1px solid #1e1e2e' }}>
-          {activeTransfers.map(([id, t]) => (
-            <FileTransferBar key={id} transferId={id} {...t}
+        <div style={s.transfers}>
+          {activeTransfers.map(([id, tr]) => (
+            <FileTransferBar key={id} transferId={id} {...tr}
               onCancel={() => { webrtcService.cancelTransfer(id); removeTransfer(id) }} />
           ))}
         </div>
       )}
 
-      {/* Messages */}
-      <div ref={messagesRef} style={s.messages}>
-        {channelMessages.length > 0 && activeChannelId && !fullyLoaded.has(activeChannelId) && (
+      <div ref={messagesRef} style={s.messages} role="log" aria-live="polite">
+        {hasMore && channelMessages.length > 0 && (
           <button style={s.loadOlderBtn} onClick={loadOlder} disabled={loadingOlder}>
             {loadingOlder ? t('chat.loadingOlder') : t('chat.loadEarlier')}
           </button>
         )}
         {channelMessages.map((msg) => (
-          <MessageBubble key={msg.id} msg={msg} currentUserId={currentUser?.id ?? ''} users={users} />
+          <MessageBubble key={msg.id} msg={msg} isMe={msg.sender_id === currentUser?.id} fallbackSender={users[msg.sender_id]} />
         ))}
+        {pending.map((p) => <PendingBubble key={p.client_id} pending={p} />)}
         <div ref={bottomRef} />
       </div>
 
-      {typingUsers.length > 0 && (
-        <div style={s.typingBar}>✏️ {typingUsers.join(', ')} {typingUsers.length === 1 ? t('chat.isTyping') : t('chat.areTyping')}…</div>
-      )}
+      <div style={s.typingBar}>
+        {typingUsers.length > 0 &&
+          `✏️ ${typingUsers.join(', ')} ${typingUsers.length === 1 ? t('chat.isTyping') : t('chat.areTyping')}…`}
+      </div>
 
-      {/* Input */}
+      {notice && <div role="alert" style={s.notice} onClick={() => setNotice('')}>{notice}</div>}
+
       <div style={s.inputArea}>
         {codeMode && (
           <div style={s.codeModeBar}>
@@ -323,7 +269,7 @@ export default function ChatWindow() {
             <select style={s.langSelect} value={codeLang} onChange={(e) => setCodeLang(e.target.value)}>
               {LANGUAGES.map((l) => <option key={l} value={l}>{l}</option>)}
             </select>
-            <button style={s.closeCodeBtn} onClick={() => setCodeMode(false)}>✕</button>
+            <button style={s.closeCodeBtn} onClick={() => setCodeMode(false)} aria-label={t('confirm.cancel')}>✕</button>
           </div>
         )}
         <div style={s.inputRow}>
@@ -336,11 +282,11 @@ export default function ChatWindow() {
             </label>
           )}
           <button style={{ ...s.iconBtn, ...(codeMode ? s.iconBtnActive : {}) }}
-            onClick={() => setCodeMode(!codeMode)} title={t('chat.insertCode')}>{'</>'}</button>
+            onClick={() => setCodeMode(!codeMode)} title={t('chat.insertCode')} aria-pressed={codeMode}>{'</>'}</button>
           <div style={{ position: 'relative', flex: 1 }}>
             <textarea ref={inputRef}
               style={{ ...s.input, ...(codeMode ? s.inputCode : {}), width: '100%' }}
-              value={text} onChange={(e) => { setText(e.target.value); sendTyping() }}
+              value={text} onChange={(e) => onTextChange(e.target.value)}
               onKeyDown={handleKeyDown} onPaste={handlePaste}
               placeholder={placeholderText} rows={codeMode ? 6 : 1} />
             {showEmoji && (
@@ -349,7 +295,7 @@ export default function ChatWindow() {
               </div>
             )}
           </div>
-          <button style={s.iconBtn} onClick={() => setShowEmoji(!showEmoji)} title={t('chat.emoji')}>😊</button>
+          <button style={s.iconBtn} onClick={() => setShowEmoji(!showEmoji)} title={t('chat.emoji')} aria-label={t('chat.emoji')}>😊</button>
           <button style={{ ...s.sendBtn, opacity: !text.trim() ? 0.4 : 1 }}
             onClick={sendMessage} disabled={!text.trim()} aria-label={t('chat.send')}>➤</button>
         </div>
@@ -361,25 +307,12 @@ export default function ChatWindow() {
         </div>
       )}
 
-      {incomingOffer && (
-        <ConfirmDialog
-          title={t('chat.incomingFile')}
-          message={t('chat.wantsToSend', { name: incomingOffer.senderName, file: incomingOffer.offer.filename, size: formatSize(incomingOffer.offer.fileSize) })}
-          confirmLabel={t('chat.accept')} cancelLabel={t('chat.decline')}
-          onConfirm={handleAcceptFile}
-          onCancel={() => { webrtcService.declineIncoming(incomingOffer.offer); setIncomingOffer(null) }}
-        />
-      )}
-
       {showSearch && (
         <SearchPanel
           onClose={() => setShowSearch(false)}
           onGoToMessage={async (channelId, messageId) => {
-            setActiveChannel(channelId)
-            clearUnread(channelId)
-            const msgs = await getMessages(channelId).catch(() => [])
-            setMessages(channelId, msgs)
             setShowSearch(false)
+            await openChannel(channelId)
             if (messageId) setScrollToMsgId(messageId)
           }}
         />
@@ -388,67 +321,69 @@ export default function ChatWindow() {
   )
 }
 
-// ─── Message bubble ───────────────────────────────────────────────────────────
-
-function MessageBubble({ msg, currentUserId, users }: {
-  msg: Message; currentUserId: string; users: Record<string, any>
+const MessageBubble = memo(function MessageBubble({ msg, isMe, fallbackSender }: {
+  msg: Message; isMe: boolean; fallbackSender?: User
 }) {
-  const isMe = msg.sender_id === currentUserId
-  const sender = msg.sender ?? users[msg.sender_id]
+  const name = msg.sender?.display_name || fallbackSender?.display_name
+  const color = msg.sender?.avatar_color || fallbackSender?.avatar_color || '#6366f1'
 
-  const renderContent = () => {
-    switch (msg.type) {
-      case 'code_snippet':
-        return <CodeBlock code={msg.content} language={msg.metadata?.language ?? 'text'} filename={msg.metadata?.filename} />
-      case 'file_inline':
-        return (
-          <div>
-            <img src={msg.content} alt={msg.metadata?.orig_name ?? t('chat.image')}
-              style={{ maxWidth: 400, maxHeight: 300, borderRadius: 8, display: 'block' }} />
-            {msg.metadata?.orig_name && <div style={{ color: '#888', fontSize: 11, marginTop: 4 }}>{msg.metadata.orig_name}</div>}
-          </div>
-        )
-      default:
-        return (
-          <span style={s.msgText}>
-            {msg.content.split('\n').map((line, i, arr) => (
-              <span key={i}>{line}{i < arr.length - 1 ? <br /> : null}</span>
-            ))}
-          </span>
-        )
-    }
+  let content: React.ReactNode
+  switch (msg.type) {
+    case 'code_snippet':
+      content = <CodeBlock code={msg.content} language={msg.metadata?.language ?? 'text'} filename={msg.metadata?.filename} />
+      break
+    case 'file_inline':
+      // Older servers accepted inline images from clients; only render data
+      // URLs so a message cannot load a remote (tracking) image.
+      content = msg.content.startsWith('data:image/')
+        ? <img src={msg.content} alt={msg.metadata?.orig_name ?? t('chat.image')} style={{ maxWidth: 400, maxHeight: 300, borderRadius: 8, display: 'block' }} />
+        : <span style={s.msgText}>{msg.metadata?.orig_name ?? t('chat.image')}</span>
+      break
+    default:
+      content = <span style={s.msgText}>{msg.content}</span>
   }
 
   return (
     <div data-msg-id={msg.id} style={{ ...s.message, ...(isMe ? s.messageMe : {}) }}>
       {!isMe && (
-        <div style={{ width: 32, height: 32, borderRadius: '50%', background: sender?.avatar_color ?? '#6366f1', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 13, fontWeight: 700, flexShrink: 0 }}>
-          {(sender?.display_name?.[0] ?? '?').toUpperCase()}
+        <div style={{ ...s.avatar, background: color }} aria-hidden="true">
+          {(name?.[0] ?? '?').toUpperCase()}
         </div>
       )}
-      <div style={{ maxWidth: '70%' }}>
-        {!isMe && <div style={s.senderName}>{sender?.display_name ?? t('chat.unknown')}</div>}
-        <div style={{ ...s.bubble, ...(isMe ? s.bubbleMe : s.bubbleThem) }}>
-          {renderContent()}
-        </div>
-        <div style={s.timestamp}>
-          {new Date(msg.created_at).toLocaleTimeString('pl', { hour: '2-digit', minute: '2-digit' })}
+      <div style={{ maxWidth: '70%', minWidth: 0 }}>
+        {!isMe && <div style={s.senderName}>{name ?? t('chat.unknown')}</div>}
+        <div style={{ ...s.bubble, ...(isMe ? s.bubbleMe : s.bubbleThem) }}>{content}</div>
+        <div style={{ ...s.timestamp, ...(isMe ? { textAlign: 'right' as const } : {}) }}>
+          <time dateTime={msg.created_at}>{formatMessageTime(msg.created_at)}</time>
         </div>
       </div>
     </div>
   )
-}
+})
 
-async function computeSHA256(file: File): Promise<string> {
-  const buf = await file.arrayBuffer()
-  const hash = await crypto.subtle.digest('SHA-256', buf)
-  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('')
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+function PendingBubble({ pending }: { pending: PendingMessage }) {
+  const failed = pending.status === 'failed'
+  return (
+    <div style={{ ...s.message, ...s.messageMe }}>
+      <div style={{ maxWidth: '70%', minWidth: 0 }}>
+        <div style={{ ...s.bubble, ...s.bubbleMe, opacity: failed ? 1 : 0.6, ...(failed ? s.bubbleFailed : {}) }}>
+          {pending.type === 'code_snippet'
+            ? <CodeBlock code={pending.content} language={pending.metadata?.language ?? 'text'} />
+            : <span style={s.msgText}>{pending.content}</span>}
+        </div>
+        <div style={{ ...s.timestamp, textAlign: 'right' }}>
+          {failed ? (
+            <span style={{ color: '#ef4444' }} role="alert">
+              {pending.error ?? t('chat.notDelivered')}{' · '}
+              <button style={s.linkBtn} onClick={() => outbox.retry(pending.client_id)}>{t('chat.retry')}</button>
+              {' · '}
+              <button style={s.linkBtn} onClick={() => outbox.discard(pending.client_id)}>{t('chat.discard')}</button>
+            </span>
+          ) : t('chat.sending')}
+        </div>
+      </div>
+    </div>
+  )
 }
 
 const LANGUAGES = ['typescript', 'javascript', 'python', 'go', 'rust', 'java', 'csharp', 'cpp', 'sql', 'bash', 'json', 'yaml', 'html', 'css', 'text']
@@ -458,13 +393,15 @@ const s: Record<string, React.CSSProperties> = {
   chatDragging: { outline: '2px dashed #6366f1', outlineOffset: -2 },
   empty: { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0f0f13' },
   header: { padding: '14px 20px', borderBottom: '1px solid #1e1e2e', display: 'flex', alignItems: 'center', gap: 10 },
-  channelName: { color: '#fff', fontWeight: 700, fontSize: 15, flex: 1 },
+  channelName: { color: '#fff', fontWeight: 700, fontSize: 15, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   statusBadge: { display: 'flex', alignItems: 'center', gap: 5, padding: '3px 8px', borderRadius: 12, background: '#1a1a2e' },
   statusDotSmall: { width: 7, height: 7, borderRadius: '50%', flexShrink: 0 },
   searchBtn: { background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 14, padding: '4px 8px', borderRadius: 6, opacity: 0.5, flexShrink: 0 },
+  transfers: { padding: '6px 20px', background: '#13131c', borderBottom: '1px solid #1e1e2e' },
   messages: { flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 2 },
   loadOlderBtn: { alignSelf: 'center', margin: '4px 0 10px', background: '#1a1a2e', border: '1px solid #2a2a3e', color: '#888', cursor: 'pointer', borderRadius: 8, padding: '5px 14px', fontSize: 12 },
   typingBar: { padding: '4px 20px', color: '#666', fontSize: 12, minHeight: 20 },
+  notice: { margin: '0 16px 6px', padding: '6px 10px', borderRadius: 6, background: '#3f2a15', color: '#f5b971', fontSize: 12, cursor: 'pointer' },
   inputArea: { padding: '10px 16px 14px', borderTop: '1px solid #1e1e2e' },
   codeModeBar: { display: 'flex', alignItems: 'center', gap: 8, background: '#1a1a2e', borderRadius: '8px 8px 0 0', padding: '6px 12px', borderBottom: '1px solid #333' },
   langSelect: { background: '#252535', border: '1px solid #333', borderRadius: 4, color: '#fff', fontSize: 12, padding: '2px 6px' },
@@ -478,11 +415,14 @@ const s: Record<string, React.CSSProperties> = {
   emojiPopup: { position: 'absolute', bottom: '110%', right: 0, zIndex: 100 },
   message: { display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 8 },
   messageMe: { flexDirection: 'row-reverse' },
+  avatar: { width: 32, height: 32, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 13, fontWeight: 700, flexShrink: 0 },
   senderName: { color: '#888', fontSize: 12, marginBottom: 3, paddingLeft: 4 },
-  bubble: { padding: '8px 14px', borderRadius: 12, wordBreak: 'break-word' },
+  bubble: { padding: '8px 14px', borderRadius: 12, wordBreak: 'break-word', overflowWrap: 'anywhere' },
   bubbleMe: { background: '#6366f1', borderTopRightRadius: 4 },
   bubbleThem: { background: '#1e1e30', borderTopLeftRadius: 4 },
-  msgText: { color: '#e0e0e0', fontSize: 14, lineHeight: 1.5 },
-  timestamp: { color: '#444', fontSize: 10, marginTop: 3, paddingLeft: 4 },
+  bubbleFailed: { background: '#3f1515', border: '1px solid #7f1d1d' },
+  linkBtn: { background: 'none', border: 'none', padding: 0, color: '#a5b4fc', cursor: 'pointer', fontSize: 10, textDecoration: 'underline' },
+  msgText: { color: '#e0e0e0', fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap' },
+  timestamp: { color: '#444', fontSize: 10, marginTop: 3, paddingLeft: 4, paddingRight: 4 },
   dropOverlay: { position: 'absolute', inset: 0, background: 'rgba(99,102,241,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' },
 }

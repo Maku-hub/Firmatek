@@ -1,39 +1,28 @@
 FROM golang:1.25-alpine AS builder
 
-WORKDIR /app
+WORKDIR /src
 
-# System dependencies for compilation
-RUN apk add --no-cache git ca-certificates tzdata
-
-# Download dependencies first (cached layer) using the committed go.mod/go.sum
+# Dependencies first so this layer stays cached until go.mod/go.sum change
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the rest of the source tree
 COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/firmatek-server ./cmd/server
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo \
-    -ldflags="-w -s" \
-    -o firmatek-server ./cmd/server
+FROM alpine:3.22
 
-# --- Final image ---
-FROM alpine:3.19
-
-RUN apk add --no-cache ca-certificates tzdata curl
-
-# Run as a non-root user
-RUN adduser -D -u 10001 appuser
+RUN apk add --no-cache ca-certificates tzdata \
+    && adduser -D -u 10001 appuser
 
 WORKDIR /app
-
-COPY --from=builder /app/firmatek-server .
+COPY --from=builder /out/firmatek-server .
 
 USER appuser
-
+ENV SERVER_PORT=8080
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+# busybox wget is enough for the health probe, no need to install curl
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -q -O /dev/null "http://127.0.0.1:${SERVER_PORT}/health" || exit 1
 
 CMD ["./firmatek-server"]

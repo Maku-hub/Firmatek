@@ -1,5 +1,12 @@
 import { create } from 'zustand'
-import type { User, Channel, Message } from '../types'
+import type { User, Channel, Message, PendingMessage } from '../types'
+
+export interface Transfer {
+  filename: string
+  progress: number
+  status: string
+  direction: string
+}
 
 interface AppState {
   currentUser: User | null
@@ -17,86 +24,114 @@ interface AppState {
   removeChannel: (channelId: string) => void
   setActiveChannel: (id: string | null) => void
   messages: Record<string, Message[]>
+  /** Whether older history may still exist on the server, per channel. */
+  hasMore: Record<string, boolean>
   addMessage: (msg: Message) => void
-  setMessages: (channelId: string, msgs: Message[]) => void
-  prependMessages: (channelId: string, older: Message[]) => void
-  typing: Record<string, Set<string>>
+  /** Merges the newest page of a channel into what is already loaded. */
+  mergeLatest: (channelId: string, page: Message[], pageSize: number) => void
+  prependMessages: (channelId: string, older: Message[], pageSize: number) => void
+  /** Outgoing messages not yet confirmed by the server (see services/outbox). */
+  pending: PendingMessage[]
+  setPending: (pending: PendingMessage[]) => void
+  typing: Record<string, string[]>
   setTyping: (channelId: string, userId: string, isTyping: boolean) => void
-  transfers: Record<string, { filename: string; progress: number; status: string; direction: string }>
-  setTransfer: (id: string, data: { filename: string; progress: number; status: string; direction: string }) => void
+  transfers: Record<string, Transfer>
+  setTransfer: (id: string, data: Transfer) => void
   removeTransfer: (id: string) => void
   unread: Record<string, number>
   incrementUnread: (channelId: string) => void
   clearUnread: (channelId: string) => void
+  reset: () => void
+}
+
+const byTime = (a: Message, b: Message) =>
+  a.created_at === b.created_at ? a.id.localeCompare(b.id) : Date.parse(a.created_at) - Date.parse(b.created_at)
+
+function merge(existing: Message[], incoming: Message[]): Message[] {
+  if (incoming.length === 0) return existing
+  const ids = new Set(existing.map((m) => m.id))
+  const fresh = incoming.filter((m) => !ids.has(m.id))
+  if (fresh.length === 0) return existing
+  return [...existing, ...fresh].sort(byTime)
+}
+
+const initialData = {
+  currentUser: null,
+  wsConnected: false,
+  users: {},
+  channels: [],
+  activeChannelId: null,
+  messages: {},
+  hasMore: {},
+  pending: [],
+  typing: {},
+  transfers: {},
+  unread: {},
 }
 
 export const useStore = create<AppState>((set) => ({
-  currentUser: null,
+  ...initialData,
   setCurrentUser: (user) => set({ currentUser: user }),
-  wsConnected: false,
   setWsConnected: (v) => set({ wsConnected: v }),
-  users: {},
-  setUsers: (users) => {
-    const map: Record<string, User> = {}
-    for (const u of users) map[u.id] = u
-    set({ users: map })
-  },
-  addUser: (user) =>
-    set((state) => ({ users: { ...state.users, [user.id]: user } })),
+  setUsers: (users) => set({ users: Object.fromEntries(users.map((u) => [u.id, u])) }),
+  addUser: (user) => set((state) => ({ users: { ...state.users, [user.id]: user } })),
   updateUserStatus: (userId, online, lastSeen) =>
     set((state) => {
-      if (!state.users[userId]) return {}
-      const updated = { ...state.users[userId], online }
-      if (lastSeen) updated.last_seen = lastSeen
-      else if (!online) updated.last_seen = new Date().toISOString()
-      return { users: { ...state.users, [userId]: updated } }
+      const user = state.users[userId]
+      if (!user) return {}
+      const last_seen = lastSeen ?? (online ? user.last_seen : new Date().toISOString())
+      return { users: { ...state.users, [userId]: { ...user, online, last_seen } } }
     }),
-  channels: [],
-  activeChannelId: null,
   setChannels: (channels) => set({ channels }),
   addChannel: (channel) =>
-    set((state) => ({
-      channels: state.channels.find((c) => c.id === channel.id) ? state.channels : [...state.channels, channel],
-    })),
+    set((state) => (state.channels.some((c) => c.id === channel.id) ? {} : { channels: [...state.channels, channel] })),
   removeChannel: (channelId) =>
     set((state) => ({ channels: state.channels.filter((c) => c.id !== channelId) })),
   setActiveChannel: (id) => set({ activeChannelId: id }),
-  messages: {},
   addMessage: (msg) =>
     set((state) => {
       const existing = state.messages[msg.channel_id] ?? []
-      if (existing.some((m) => m.id === msg.id)) return {}
-      // Keep chronological order even if a message arrives late/out of order
-      // (e.g. queued offline messages delivered on reconnect).
-      const next = [...existing, msg].sort(
-        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
-      )
-      return { messages: { ...state.messages, [msg.channel_id]: next } }
+      const next = merge(existing, [msg])
+      return next === existing ? {} : { messages: { ...state.messages, [msg.channel_id]: next } }
     }),
-  setMessages: (channelId, msgs) =>
-    set((state) => ({ messages: { ...state.messages, [channelId]: msgs } })),
-  prependMessages: (channelId, older) =>
+  mergeLatest: (channelId, page, pageSize) =>
     set((state) => {
-      const existing = state.messages[channelId] ?? []
-      const ids = new Set(existing.map((m) => m.id))
-      const merged = [...older.filter((m) => !ids.has(m.id)), ...existing]
-      merged.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-      return { messages: { ...state.messages, [channelId]: merged } }
+      const existing = state.messages[channelId]
+      const next = merge(existing ?? [], page)
+      // Only the first load decides whether there is more history; later
+      // refreshes must not hide the "load earlier" button.
+      const hasMore = existing === undefined ? page.length >= pageSize : (state.hasMore[channelId] ?? false)
+      return {
+        messages: { ...state.messages, [channelId]: next },
+        hasMore: { ...state.hasMore, [channelId]: hasMore },
+      }
     }),
-  typing: {},
+  prependMessages: (channelId, older, pageSize) =>
+    set((state) => ({
+      messages: { ...state.messages, [channelId]: merge(state.messages[channelId] ?? [], older) },
+      hasMore: { ...state.hasMore, [channelId]: older.length >= pageSize },
+    })),
+  setPending: (pending) => set({ pending }),
   setTyping: (channelId, userId, isTyping) =>
     set((state) => {
-      const current = new Set(state.typing[channelId] ?? [])
-      isTyping ? current.add(userId) : current.delete(userId)
-      return { typing: { ...state.typing, [channelId]: current } }
+      const current = state.typing[channelId] ?? []
+      const has = current.includes(userId)
+      if (has === isTyping) return {}
+      const next = isTyping ? [...current, userId] : current.filter((id) => id !== userId)
+      return { typing: { ...state.typing, [channelId]: next } }
     }),
-  transfers: {},
   setTransfer: (id, data) => set((state) => ({ transfers: { ...state.transfers, [id]: data } })),
   removeTransfer: (id) =>
-    set((state) => { const t = { ...state.transfers }; delete t[id]; return { transfers: t } }),
-  unread: {},
+    set((state) => {
+      if (!(id in state.transfers)) return {}
+      const { [id]: _, ...rest } = state.transfers
+      return { transfers: rest }
+    }),
   incrementUnread: (channelId) =>
     set((state) => ({ unread: { ...state.unread, [channelId]: (state.unread[channelId] ?? 0) + 1 } })),
   clearUnread: (channelId) =>
-    set((state) => ({ unread: { ...state.unread, [channelId]: 0 } })),
+    set((state) => (state.unread[channelId] ? { unread: { ...state.unread, [channelId]: 0 } } : {})),
+  // Clears everything that belongs to the signed-in user (on logout), so the
+  // next account does not see the previous one's messages.
+  reset: () => set(initialData),
 }))

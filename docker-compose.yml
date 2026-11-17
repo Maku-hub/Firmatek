@@ -68,6 +68,9 @@ services:
     image: caddy:2-alpine
     container_name: firmatek-caddy
     profiles: ["proxy"]
+    environment:
+      FIRMATEK_DOMAIN: ${FIRMATEK_DOMAIN:-firmatek.local}
+      SERVER_PORT: ${SERVER_PORT:-8080}
     ports:
       - "80:80"
       - "443:443"

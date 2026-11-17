@@ -20,6 +20,9 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         // ─── System notifications ──────────────────────────────────────────
         .plugin(tauri_plugin_notification::init())
+        // Received files are written straight to disk, see webrtc.ts
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             // ─── System tray ───────────────────────────────────────────────
             let show = MenuItem::with_id(app, "show", "Show Firmatek", true, None::<&str>)?;
@@ -38,7 +41,8 @@ pub fn run() {
                             let _ = w.unminimize();
                         }
                     }
-                    "quit" => std::process::exit(0),
+                    // app.exit() runs plugin shutdown hooks; process::exit would skip them
+                    "quit" => app.exit(0),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {

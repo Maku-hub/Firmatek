@@ -12,14 +12,22 @@ const DEFAULT: Settings = { uiScale: 100, sendOnEnter: true, notifSound: true }
 const STORAGE_KEY = 'firmatek_settings'
 
 export function loadSettings(): Settings {
+  if (cached) return cached
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    return raw ? { ...DEFAULT, ...JSON.parse(raw) } : DEFAULT
-  } catch { return DEFAULT }
+    cached = raw ? { ...DEFAULT, ...JSON.parse(raw) } : DEFAULT
+  } catch {
+    cached = DEFAULT
+  }
+  return cached!
 }
 
+// Read on every keystroke in the chat input, so keep a parsed copy around.
+let cached: Settings | null = null
+
 function saveSettings(s: Settings) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(s))
+  cached = s
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)) } catch { /* storage full or disabled */ }
 }
 
 // Scales only the main app wrapper (not the login screen)
@@ -70,7 +78,12 @@ export default function SettingsModal({ onClose }: Props) {
     saveSettings(settings)
   }, [settings])
 
-  // Fetch the current autostart state
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
   useEffect(() => {
     isAutostartEnabled()
       .then(setAutostart)
@@ -93,7 +106,7 @@ export default function SettingsModal({ onClose }: Props) {
       <div style={s.modal} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={t('settings.title')}>
         <div style={s.header}>
           <span style={s.title}>{t('settings.title')}</span>
-          <button style={s.closeBtn} onClick={onClose}>✕</button>
+          <button style={s.closeBtn} onClick={onClose} aria-label={t('settings.done')}>✕</button>
         </div>
 
         <section style={s.section}>
@@ -184,7 +197,7 @@ export default function SettingsModal({ onClose }: Props) {
 
 const s: Record<string, React.CSSProperties> = {
   overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
-  modal: { background: '#1a1a24', borderRadius: 14, width: 420, maxHeight: 'calc(100vh - 40px)', overflowY: 'auto', boxShadow: '0 24px 60px rgba(0,0,0,0.6)', border: '1px solid #2a2a3e', overflow: 'hidden' },
+  modal: { background: '#1a1a24', borderRadius: 14, width: 420, maxWidth: 'calc(100vw - 32px)', maxHeight: 'calc(100vh - 40px)', overflowY: 'auto', boxShadow: '0 24px 60px rgba(0,0,0,0.6)', border: '1px solid #2a2a3e' },
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '18px 22px', borderBottom: '1px solid #2a2a3e' },
   title: { color: '#fff', fontWeight: 700, fontSize: 15 },
   closeBtn: { background: 'transparent', border: 'none', color: '#666', cursor: 'pointer', fontSize: 16 },

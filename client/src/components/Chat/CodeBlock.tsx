@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { createHighlighter } from 'shiki'
+import { createHighlighterCore, type HighlighterCore } from 'shiki/core'
 import { t } from '../../i18n'
 
 interface Props {
@@ -8,18 +8,32 @@ interface Props {
   filename?: string
 }
 
-let highlighterPromise: ReturnType<typeof createHighlighter> | null = null
+let highlighterPromise: Promise<HighlighterCore> | null = null
 
+// Importing from 'shiki' directly would bundle every grammar it ships
+// (~250 languages, 9 MB). Only the languages offered in the composer are
+// loaded here.
 function getHighlighter() {
-  if (!highlighterPromise) {
-    highlighterPromise = createHighlighter({
-      themes: ['one-dark-pro'],
-      langs: [
-        'typescript', 'javascript', 'python', 'go', 'rust', 'java',
-        'csharp', 'cpp', 'sql', 'bash', 'json', 'yaml', 'html', 'css',
-      ],
-    })
-  }
+  highlighterPromise ??= createHighlighterCore({
+    themes: [import('shiki/themes/one-dark-pro.mjs')],
+    langs: [
+      import('shiki/langs/typescript.mjs'),
+      import('shiki/langs/javascript.mjs'),
+      import('shiki/langs/python.mjs'),
+      import('shiki/langs/go.mjs'),
+      import('shiki/langs/rust.mjs'),
+      import('shiki/langs/java.mjs'),
+      import('shiki/langs/csharp.mjs'),
+      import('shiki/langs/cpp.mjs'),
+      import('shiki/langs/sql.mjs'),
+      import('shiki/langs/bash.mjs'),
+      import('shiki/langs/json.mjs'),
+      import('shiki/langs/yaml.mjs'),
+      import('shiki/langs/html.mjs'),
+      import('shiki/langs/css.mjs'),
+    ],
+    loadWasm: import('shiki/wasm'),
+  })
   return highlighterPromise
 }
 
@@ -38,14 +52,18 @@ export default function CodeBlock({ code, language, filename }: Props) {
         // fallback if the language is unsupported
         setHtml(`<pre style="color:#abb2bf;background:#282c34;padding:16px;border-radius:8px;overflow-x:auto"><code>${escapeHtml(code)}</code></pre>`)
       }
-    })
+    }).catch(() => { /* keep the plain <pre> fallback */ })
     return () => { cancelled = true }
   }, [code, language])
 
+  useEffect(() => {
+    if (!copied) return
+    const timer = setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(timer)
+  }, [copied])
+
   const handleCopy = () => {
-    navigator.clipboard.writeText(code)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    navigator.clipboard.writeText(code).then(() => setCopied(true), () => {})
   }
 
   return (
@@ -73,6 +91,7 @@ function escapeHtml(str: string) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
 }
 
 const styles: Record<string, React.CSSProperties> = {

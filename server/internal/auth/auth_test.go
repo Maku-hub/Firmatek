@@ -2,8 +2,11 @@ package auth
 
 import (
 	"testing"
+	"time"
 
 	"firmatek/server/internal/config"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 func TestTokenRoundTrip(t *testing.T) {
@@ -28,6 +31,35 @@ func TestValidateRejectsGarbage(t *testing.T) {
 	}
 	if _, err := ValidateToken(""); err == nil {
 		t.Fatal("expected error for empty token")
+	}
+}
+
+func TestValidateRejectsOtherAlgorithms(t *testing.T) {
+	secret := "unit-test-secret-value-1234567890"
+	Init(&config.JWTConfig{Secret: secret})
+	claims := Claims{
+		UserID: "u",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			Issuer:    issuer,
+		},
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS512, claims).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateToken(tok); err == nil {
+		t.Fatal("expected HS512 token to be rejected")
+	}
+}
+
+func TestValidateRejectsMissingExpiry(t *testing.T) {
+	secret := "unit-test-secret-value-1234567890"
+	Init(&config.JWTConfig{Secret: secret})
+	claims := Claims{UserID: "u", RegisteredClaims: jwt.RegisteredClaims{Issuer: issuer}}
+	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	if _, err := ValidateToken(tok); err == nil {
+		t.Fatal("expected token without exp to be rejected")
 	}
 }
 

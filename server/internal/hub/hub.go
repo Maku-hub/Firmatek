@@ -3,7 +3,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -13,10 +13,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Hub manages all active WebSocket connections
+// Hub tracks live WebSocket connections. A user may be connected from several
+// devices at once, so each user ID maps to a set of clients.
 type Hub struct {
 	mu      sync.RWMutex
-	clients map[string]*Client // userID → Client
+	clients map[string]map[*Client]struct{}
 
 	register   chan *Client
 	unregister chan *Client
@@ -27,13 +28,14 @@ type Hub struct {
 }
 
 type targetedMessage struct {
-	targetUserID string
-	data         []byte
+	userID  string
+	data    []byte
+	durable bool // queue in Redis when the user has no live connection
 }
 
 func NewHub(c *cache.Cache, db interface{ GetPool() *pgxpool.Pool }) *Hub {
 	return &Hub{
-		clients:    make(map[string]*Client),
+		clients:    make(map[string]map[*Client]struct{}),
 		register:   make(chan *Client, 32),
 		unregister: make(chan *Client, 32),
 		send:       make(chan *targetedMessage, 256),
@@ -42,154 +44,152 @@ func NewHub(c *cache.Cache, db interface{ GetPool() *pgxpool.Pool }) *Hub {
 	}
 }
 
-// Run – the hub's main loop, started in a goroutine
+// Run is the hub's event loop. It must run in its own goroutine.
 func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
 			h.mu.Lock()
-			h.clients[client.UserID] = client
+			conns := h.clients[client.UserID]
+			firstConn := len(conns) == 0
+			if conns == nil {
+				conns = make(map[*Client]struct{})
+				h.clients[client.UserID] = conns
+			}
+			conns[client] = struct{}{}
 			h.mu.Unlock()
 
-			ctx := context.Background()
-			_ = h.cache.SetUserOnline(ctx, client.UserID)
-
-			// Deliver any queued messages
 			go h.deliverOfflineMessages(client)
 
-			// Broadcast: this user is online
-			h.broadcastUserStatus(client.UserID, client.DisplayName, true, time.Time{})
-			fmt.Printf("[Hub] Registered: %s (%s)\n", client.DisplayName, client.UserID)
+			if firstConn {
+				h.broadcastUserStatus(client.UserID, client.DisplayName, true, time.Time{})
+			}
+			log.Printf("hub: %s connected (%d session(s))", client.UserID, len(conns))
 
 		case client := <-h.unregister:
-			h.mu.Lock()
-			removed := false
-			if existing, ok := h.clients[client.UserID]; ok && existing == client {
-				delete(h.clients, client.UserID)
-				removed = true
-			}
-			h.mu.Unlock()
-
-			client.closeSend()
-
-			// If a newer connection already replaced this one, the user is still
-			// online – don't flip their status or last_seen.
-			if !removed {
-				fmt.Printf("[Hub] Stale connection closed (replaced): %s\n", client.UserID)
-				continue
-			}
-
-			ctx := context.Background()
-			_ = h.cache.SetUserOffline(ctx, client.UserID)
-
-			// Update last_seen in the database
-			now := time.Now()
-			if h.db != nil {
-				_, _ = h.db.Exec(ctx, `UPDATE users SET last_seen=$1 WHERE id=$2`, now, client.UserID)
-			}
-
-			// Broadcast: offline with the current timestamp
-			h.broadcastUserStatus(client.UserID, client.DisplayName, false, now)
-			fmt.Printf("[Hub] Unregistered: %s (%s)\n", client.DisplayName, client.UserID)
+			h.drop(client)
 
 		case msg := <-h.send:
 			h.mu.RLock()
-			client, online := h.clients[msg.targetUserID]
+			conns := make([]*Client, 0, len(h.clients[msg.userID]))
+			for c := range h.clients[msg.userID] {
+				conns = append(conns, c)
+			}
 			h.mu.RUnlock()
 
-			if online && !client.trySend(msg.data) {
-				// Buffer full (or already closed) – drop the client so a stuck
-				// connection cannot block the hub. closeSend() is idempotent.
-				h.mu.Lock()
-				if existing, ok := h.clients[msg.targetUserID]; ok && existing == client {
-					delete(h.clients, msg.targetUserID)
+			if len(conns) == 0 {
+				if msg.durable {
+					if err := h.cache.EnqueueOfflineMessage(context.Background(), msg.userID, msg.data); err != nil {
+						log.Printf("hub: queue offline message for %s: %v", msg.userID, err)
+					}
 				}
-				h.mu.Unlock()
-				client.closeSend()
-				fmt.Printf("[Hub] Evicted slow client (buffer full): %s\n", client.UserID)
+				continue
+			}
+			for _, c := range conns {
+				if !c.trySend(msg.data) {
+					// Buffer full: drop the connection rather than let one stuck
+					// client stall the hub. The client reconnects and reloads.
+					log.Printf("hub: evicting slow client %s", c.UserID)
+					h.drop(c)
+				}
 			}
 		}
 	}
 }
 
-// SendToUser – sends a message to a specific user
-// If the user is offline, the message is queued in Redis
-func (h *Hub) SendToUser(userID string, msg *models.WSMessage) {
-	data, err := json.Marshal(msg)
-	if err != nil {
+// drop removes a single connection. When it was the user's last one the user
+// is marked offline and everyone is notified. Safe to call more than once for
+// the same client.
+func (h *Hub) drop(client *Client) {
+	h.mu.Lock()
+	conns, ok := h.clients[client.UserID]
+	_, present := conns[client]
+	lastConn := false
+	if ok && present {
+		delete(conns, client)
+		if len(conns) == 0 {
+			delete(h.clients, client.UserID)
+			lastConn = true
+		}
+	}
+	h.mu.Unlock()
+
+	client.closeSend()
+	if !lastConn {
 		return
 	}
 
-	h.mu.RLock()
-	_, online := h.clients[userID]
-	h.mu.RUnlock()
-
-	if online {
-		h.send <- &targetedMessage{targetUserID: userID, data: data}
-	} else {
-		// Queue in Redis for the offline user
-		_ = h.cache.EnqueueOfflineMessage(context.Background(), userID, msg)
+	now := time.Now()
+	if h.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if _, err := h.db.Exec(ctx, `UPDATE users SET last_seen=$1 WHERE id=$2`, now, client.UserID); err != nil {
+			log.Printf("hub: update last_seen for %s: %v", client.UserID, err)
+		}
+		cancel()
 	}
+	h.broadcastUserStatus(client.UserID, client.DisplayName, false, now)
+	log.Printf("hub: %s disconnected", client.UserID)
 }
 
-// SendToAll – broadcasts to all connected clients
+// SendToUser delivers msg to every connection of the user. Chat messages and
+// channel invitations are queued for later if the user is offline; transient
+// events (typing, WebRTC signalling) are dropped.
+func (h *Hub) SendToUser(userID string, msg *models.WSMessage) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("hub: marshal %s: %v", msg.Type, err)
+		return
+	}
+	h.send <- &targetedMessage{userID: userID, data: data, durable: isDurable(msg.Type)}
+}
+
+func isDurable(t models.WSMessageType) bool {
+	return t == models.WSTypeChatMessage || t == models.WSTypeChannelAdded
+}
+
+// SendToAll broadcasts to every live connection. Best effort: a client with a
+// full buffer simply misses the event.
 func (h *Hub) SendToAll(msg *models.WSMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-
-	for _, client := range h.clients {
-		client.trySend(data)
+	for _, conns := range h.clients {
+		for c := range conns {
+			c.trySend(data)
+		}
 	}
 }
 
-// SendToChannel – sends to all members of a channel (from the provided list)
+// SendToChannel sends a transient event to the live connections of the given
+// members, skipping excludeUserID.
 func (h *Hub) SendToChannel(memberIDs []string, msg *models.WSMessage, excludeUserID string) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-
 	for _, uid := range memberIDs {
 		if uid == excludeUserID {
 			continue
 		}
-		if client, ok := h.clients[uid]; ok {
-			client.trySend(data)
+		for c := range h.clients[uid] {
+			c.trySend(data)
 		}
 	}
 }
 
-// Register – registers a client with the hub (public API)
 func (h *Hub) Register(client *Client) {
 	h.register <- client
 }
 
-// IsOnline – whether the user is currently connected
 func (h *Hub) IsOnline(userID string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	_, ok := h.clients[userID]
-	return ok
-}
-
-// OnlineUsers – returns a slice of the currently online user IDs
-func (h *Hub) OnlineUsers() []string {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	ids := make([]string, 0, len(h.clients))
-	for id := range h.clients {
-		ids = append(ids, id)
-	}
-	return ids
+	return len(h.clients[userID]) > 0
 }
 
 func (h *Hub) broadcastUserStatus(userID, displayName string, online bool, lastSeen time.Time) {
@@ -199,26 +199,26 @@ func (h *Hub) broadcastUserStatus(userID, displayName string, online bool, lastS
 		Online:      online,
 	}
 	if !lastSeen.IsZero() {
-		ls := lastSeen.Format(time.RFC3339)
-		payload.LastSeen = ls
+		payload.LastSeen = lastSeen.Format(time.RFC3339)
 	}
-	msg := &models.WSMessage{
-		Type:    models.WSTypeUserStatus,
-		Payload: payload,
-	}
-	h.SendToAll(msg)
+	h.SendToAll(&models.WSMessage{Type: models.WSTypeUserStatus, Payload: payload})
 }
 
 func (h *Hub) deliverOfflineMessages(client *Client) {
 	msgs, err := h.cache.DequeueOfflineMessages(context.Background(), client.UserID)
-	if err != nil || len(msgs) == 0 {
+	if err != nil {
+		log.Printf("hub: read offline queue for %s: %v", client.UserID, err)
 		return
 	}
-
-	for _, data := range msgs {
+	for i, data := range msgs {
 		if !client.trySend(data) {
+			// The client loads channel history on its own, so nothing is lost
+			// permanently, but it is worth knowing about.
+			log.Printf("hub: %d queued message(s) for %s not delivered", len(msgs)-i, client.UserID)
 			return
 		}
 	}
-	fmt.Printf("[Hub] Delivered %d queued messages to %s\n", len(msgs), client.UserID)
+	if len(msgs) > 0 {
+		log.Printf("hub: delivered %d queued message(s) to %s", len(msgs), client.UserID)
+	}
 }

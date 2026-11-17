@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -13,23 +14,27 @@ type Config struct {
 	Redis       RedisConfig
 	JWT         JWTConfig
 	LDAP        LDAPConfig
-	App            AppConfig
-	TURN           TURNConfig
-	NotifyToken    string
-	AllowedOrigins []string // empty => allow all (with a warning)
+	App         AppConfig
+	TURN        TURNConfig
+	NotifyToken string
+	// AllowedOrigins limits CORS and WebSocket origins. Empty allows all.
+	AllowedOrigins []string
+	// TrustedProxies lists proxy addresses/CIDRs whose X-Forwarded-For header
+	// is honoured. Empty means the TCP peer address is always used.
+	TrustedProxies []string
 }
 
 type ServerConfig struct{ Port string }
-type DatabaseConfig struct{ Host, Port, Name, User, Password string }
+type DatabaseConfig struct{ Host, Port, Name, User, Password, SSLMode string }
 type RedisConfig struct{ Host, Port, Password string }
 type JWTConfig struct{ Secret string }
 
-// TURNConfig holds settings for issuing time-limited TURN credentials
-// (coturn REST API / `use-auth-secret`). Secret empty => STUN only.
+// TURNConfig holds the coturn `use-auth-secret` settings used to mint
+// short-lived TURN credentials. An empty Secret means STUN only.
 type TURNConfig struct {
-	Secret string   // shared static-auth-secret (must match coturn)
-	URLs   []string // e.g. turn:turn.firma.local:3478
-	TTLSec int      // credential lifetime in seconds
+	Secret string
+	URLs   []string // e.g. turn:turn.example.local:3478
+	TTLSec int
 }
 
 type LDAPConfig struct {
@@ -41,21 +46,35 @@ type LDAPConfig struct {
 	BindPassword       string
 	UserFilter         string
 	EnableRegistration bool
-	TLSSkipVerify      bool // skip TLS cert verification (set true only for self-signed AD)
+	TLSSkipVerify      bool // only for a self-signed AD certificate
 }
 
 type AppConfig struct{ Name string }
 
+// RegistrationOpen reports whether users may create local accounts. With LDAP
+// enabled every login goes to the directory, so local accounts would be
+// unusable and are never offered.
+func (c *Config) RegistrationOpen() bool {
+	return c.LDAP.EnableRegistration && !c.LDAP.Enabled
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
-		Server:   ServerConfig{Port: getEnv("SERVER_PORT", "8080")},
+		Server: ServerConfig{Port: getEnv("SERVER_PORT", "8080")},
 		Database: DatabaseConfig{
-			Host: getEnv("DB_HOST", "localhost"), Port: getEnv("DB_PORT", "5432"),
-			Name: getEnv("DB_NAME", "firmatek"),   User: getEnv("DB_USER", "firmatek"),
+			Host:     getEnv("DB_HOST", "localhost"),
+			Port:     getEnv("DB_PORT", "5432"),
+			Name:     getEnv("DB_NAME", "firmatek"),
+			User:     getEnv("DB_USER", "firmatek"),
 			Password: getEnv("DB_PASSWORD", ""),
+			SSLMode:  getEnv("DB_SSLMODE", "disable"),
 		},
-		Redis:  RedisConfig{Host: getEnv("REDIS_HOST", "localhost"), Port: getEnv("REDIS_PORT", "6379"), Password: getEnv("REDIS_PASSWORD", "")},
-		JWT:    JWTConfig{Secret: getEnv("JWT_SECRET", "change_this_in_production")},
+		Redis: RedisConfig{
+			Host:     getEnv("REDIS_HOST", "localhost"),
+			Port:     getEnv("REDIS_PORT", "6379"),
+			Password: getEnv("REDIS_PASSWORD", ""),
+		},
+		JWT: JWTConfig{Secret: getEnv("JWT_SECRET", "")},
 		LDAP: LDAPConfig{
 			Enabled:            getEnv("LDAP_ENABLED", "false") == "true",
 			URL:                getEnv("LDAP_URL", "ldap://localhost:389"),
@@ -75,25 +94,49 @@ func Load() (*Config, error) {
 		},
 		NotifyToken:    getEnv("NOTIFY_TOKEN", ""),
 		AllowedOrigins: parseCSV(getEnv("ALLOWED_ORIGINS", "")),
+		TrustedProxies: parseCSV(getEnv("TRUSTED_PROXIES", "")),
 	}
 
-	// A weak or placeholder JWT secret lets anyone forge tokens, so refuse to
-	// start rather than only warning.
-	if len(cfg.JWT.Secret) < 32 || strings.HasPrefix(strings.ToLower(cfg.JWT.Secret), "change") {
-		return nil, fmt.Errorf("JWT_SECRET is missing, too short (<32 chars), or still a placeholder – set a strong random value, e.g. `openssl rand -hex 32`")
+	// A weak or placeholder secret lets anyone forge tokens.
+	if len(cfg.JWT.Secret) < 32 || isPlaceholder(cfg.JWT.Secret) {
+		return nil, fmt.Errorf("JWT_SECRET is missing, shorter than 32 characters or still a placeholder; generate one with `openssl rand -hex 32`")
 	}
-	if cfg.NotifyToken == "" {
-		fmt.Println("[WARN] NOTIFY_TOKEN is not set – the /api/notify endpoint is disabled")
+
+	switch {
+	case cfg.NotifyToken == "":
+		log.Println("config: NOTIFY_TOKEN not set, /api/notify is disabled")
+	case len(cfg.NotifyToken) < 16 || isPlaceholder(cfg.NotifyToken):
+		log.Println("config: NOTIFY_TOKEN is too short or still a placeholder, /api/notify is disabled")
+		cfg.NotifyToken = ""
+	}
+
+	if cfg.LDAP.Enabled && cfg.LDAP.EnableRegistration {
+		log.Println("config: ENABLE_REGISTRATION is ignored while LDAP_ENABLED=true")
 	}
 	return cfg, nil
 }
 
-func (c *DatabaseConfig) DSN() string {
-	return fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=disable",
-		c.Host, c.Port, c.Name, c.User, c.Password)
+func isPlaceholder(s string) bool {
+	return strings.HasPrefix(strings.ToLower(s), "change")
 }
+
+func (c *DatabaseConfig) DSN() string {
+	return fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=%s",
+		quoteDSN(c.Host), quoteDSN(c.Port), quoteDSN(c.Name), quoteDSN(c.User), quoteDSN(c.Password), quoteDSN(c.SSLMode))
+}
+
+// quoteDSN quotes a libpq keyword/value so passwords containing spaces or
+// quotes do not break the connection string.
+func quoteDSN(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `'`, `\'`)
+	return "'" + v + "'"
+}
+
 func getEnv(key, fallback string) string {
-	if val := os.Getenv(key); val != "" { return val }
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
 	return fallback
 }
 
